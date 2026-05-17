@@ -30,7 +30,7 @@ import { enrichFromTranscript, hookEventsFromPayload } from './hooks/dispatch.js
 import { installEntry } from './install/manager.js'
 import { matchesBackfillFilters } from './lib/backfill.js'
 import { defaultMachineName, ensureLocalMachineId, readConfig, writeConfig } from './lib/config.js'
-import { DEFAULT_API_URL, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS, PACKAGE_VERSION } from './lib/constants.js'
+import { DEFAULT_API_URL, DEFAULT_BACKFILL_BATCH_BYTES, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS, PACKAGE_VERSION } from './lib/constants.js'
 import { isPlainObject, numberOption, stringOption, valuesOption } from './lib/fields.js'
 import { countDirectoryEntries, listJsonlFiles, pathExists, readJsonIfExists } from './lib/fs.js'
 import { ProgressBar } from './lib/progress.js'
@@ -159,7 +159,8 @@ function createCli(ctx: RunContext, registry: AdapterRegistry) {
     .option('--include-source-path', 'Include local source paths in output')
     .option('--import-run <id>', 'Import run id for verify/resume workflows')
     .option('--limit <count>', 'Maximum session files to parse')
-    .option('--batch-size <count>', 'Events per batch during import')
+    .option('--batch-size <count>', 'Max rollups per request (also bounded by --batch-bytes)')
+    .option('--batch-bytes <bytes>', 'Soft byte cap for the JSON body of a single ingest POST')
     .option('--replace', 'Replace conflicting records during import (default)')
     .option('--skip-conflicts', 'Skip conflicting records instead of replacing them')
     .option('--force', 'Force full re-import: clear watermark and re-process all files')
@@ -196,6 +197,7 @@ function normalizeOptions(options: Record<string, unknown>): ParsedArgs {
     sourceRoot: 'source-root',
     importRun: 'import-run',
     batchSize: 'batch-size',
+    batchBytes: 'batch-bytes',
     skipConflicts: 'skip-conflicts',
   }
 
@@ -723,7 +725,14 @@ async function importBackfillPlan(
   const counts: BackfillImportCounts = { inserted: 0, skipped: 0, conflicts: 0, failed: 0 }
   const rollups = buildSessionRollups(canonicalEvents)
   const batchSize = Math.max(1, Math.floor(numberOption(options['batch-size']) || DEFAULT_BACKFILL_BATCH_SIZE))
-  const totalBatches = Math.ceil(rollups.length / batchSize)
+  const batchBytes = Math.max(64 * 1024, Math.floor(numberOption(options['batch-bytes']) || DEFAULT_BACKFILL_BATCH_BYTES))
+  // Pre-pack into batches bounded by BOTH count and serialized-byte
+  // size. The byte cap keeps us under nginx's default 1 MiB
+  // `client_max_body_size`; the count cap protects request latency on
+  // tiny rollups. A single rollup that exceeds the byte cap is sent on
+  // its own — the server may 413, surfaced as a batch failure.
+  const batches = packRollupBatches(rollups, batchSize, batchBytes)
+  const totalBatches = batches.length
 
   let uploadBar: ProgressBar | undefined
   if (!options.json) {
@@ -732,9 +741,9 @@ async function importBackfillPlan(
     uploadBar.init(totalBatches, `0/${totalBatches} batches, 0 inserted`)
   }
 
-  for (let index = 0; index < rollups.length; index += batchSize) {
-    const batch = rollups.slice(index, index + batchSize)
-    const batchNumber = Math.floor(index / batchSize) + 1
+  for (let i = 0; i < batches.length; i += 1) {
+    const batch = batches[i]!
+    const batchNumber = i + 1
     try {
       const result = await sendSessionRollupBatch(batch, options, ctx)
       counts.inserted += result.inserted
@@ -743,7 +752,7 @@ async function importBackfillPlan(
       counts.failed += result.failed
     }
     catch (error) {
-      debug(ctx, `backfill rollup batch ${index + 1}-${index + batch.length} failed: ${(error as Error).message}\n`)
+      debug(ctx, `backfill rollup batch ${batchNumber}/${totalBatches} (${batch.length} rollups) failed: ${(error as Error).message}\n`)
       counts.failed += batch.length
     }
     if (uploadBar) {
@@ -871,6 +880,36 @@ function shouldUseIncrementalBackfill(options: ParsedArgs): boolean {
 // its mtime advance naturally on the next run, so no grace window is
 // needed — and a grace window would cause already-uploaded files to be
 // resubmitted on every run.
+// Group rollups into upload batches bounded by count AND serialized
+// JSON byte size. The byte estimate uses the same serializer the HTTP
+// layer will use (JSON.stringify), so it tracks the real wire size.
+// Two-byte commas / brackets are ignored in the estimate — the actual
+// body is `{"rollups":[...]}` and adds a fixed envelope, both well
+// under any practical cap.
+function packRollupBatches(
+  rollups: SessionRollup[],
+  maxCount: number,
+  maxBytes: number,
+): SessionRollup[][] {
+  const batches: SessionRollup[][] = []
+  let current: SessionRollup[] = []
+  let currentBytes = 0
+  for (const rollup of rollups) {
+    const size = JSON.stringify(rollup).length
+    const wouldExceed = current.length > 0
+      && (current.length >= maxCount || currentBytes + size > maxBytes)
+    if (wouldExceed) {
+      batches.push(current)
+      current = []
+      currentBytes = 0
+    }
+    current.push(rollup)
+    currentBytes += size
+  }
+  if (current.length > 0) batches.push(current)
+  return batches
+}
+
 function selectBackfillFilesForImport(
   files: BackfillSourceFile[],
   watermarkTs: string | undefined,
