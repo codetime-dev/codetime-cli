@@ -1,0 +1,55 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "codetime@*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "npm dist-tag (default: latest)"
+        required: false
+        default: latest
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm trusted publishing (OIDC)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: pnpm
+
+      # npm >= 11.5.1 is required for trusted publishing (OIDC)
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Bundle CLI
+        run: pnpm --filter codetime-cli run build:bundle
+
+      # pnpm pack rewrites `workspace:*` to concrete versions in the tarball;
+      # npm publish then uploads with OIDC (trusted publishing + provenance).
+      - name: Pack tarball
+        working-directory: packages/cli
+        run: pnpm pack --pack-destination .
+
+      - name: Publish to npm
+        working-directory: packages/cli
+        run: npm publish codetime-cli-*.tgz --access public --tag "${{ github.event.inputs.tag || 'latest' }}"
