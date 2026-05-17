@@ -20,6 +20,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # On manual dispatch, jump to the latest `codetime@*` tag so we always
+      # publish the most recent release rather than whatever is on the branch.
+      - name: Checkout latest tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          latest_tag=$(git tag --list 'codetime@*' --sort=-v:refname | head -n 1)
+          if [ -z "$latest_tag" ]; then
+            echo "no codetime@* tag found" >&2
+            exit 1
+          fi
+          echo "checking out $latest_tag"
+          git checkout "refs/tags/$latest_tag"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
