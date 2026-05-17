@@ -6,8 +6,8 @@ on:
       - 'codetime@*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'npm dist-tag (default: latest)'
+      dist_tag:
+        description: 'npm dist-tag channel (latest / beta / next). Git tag is auto-selected.'
         required: false
         default: latest
 
@@ -68,4 +68,4 @@ jobs:
 
       - name: Publish to npm
         working-directory: packages/cli
-        run: npm publish codetime-cli-*.tgz --access public --tag "${{ github.event.inputs.tag || 'latest' }}"
+        run: npm publish codetime-cli-*.tgz --access public --tag "${{ github.event.inputs.dist_tag || 'latest' }}"
