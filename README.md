@@ -7,7 +7,7 @@ pre-aggregated session rollups to `/v3/agent/ingest`.
 ## Install
 
 ```sh
-npm i -g codetime
+npm i -g codetime-cli   # bin is `codetime`
 
 # 1. Copy your upload token from https://codetime.dev/dashboard/settings.
 # 2. Tell the CLI about it (writes ~/.codetime/config.json).
@@ -25,7 +25,7 @@ the `X-Machine-Id` header (a UUID minted once and persisted under
 
 ## Packages
 
-- `packages/cli` — the published `codetime` npm package.
+- `packages/cli` — the published `codetime-cli` npm package (bin: `codetime`).
 - `packages/shared` — internal `@codetime/shared` types, inlined into
   the published bundle.
 

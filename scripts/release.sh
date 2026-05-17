@@ -5,7 +5,7 @@
 #   pnpm release [--dry] [--tag <tag>]
 #
 # Version bumping is intentionally out of scope — edit
-# `packages/cli/package.json` (or use `pnpm --filter codetime version <bump>`)
+# `packages/cli/package.json` (or use `pnpm --filter codetime-cliversion <bump>`)
 # and commit before running this.
 #
 # What it does:
@@ -13,7 +13,7 @@
 #   2. Verifies npm auth
 #   3. Installs deps + runs tests (which also builds)
 #   4. Re-bundles via esbuild → bin/codetime.mjs
-#   5. Publishes via `pnpm --filter codetime publish` with --access public
+#   5. Publishes via `pnpm --filter codetime-clipublish` with --access public
 #   6. Tags + pushes (skipped in --dry)
 #
 # Prereqs: `npm login` once locally (or NODE_AUTH_TOKEN env in CI).
@@ -76,10 +76,10 @@ pnpm test
 
 # ── bundle ──
 log "bundling CLI"
-pnpm --filter codetime run build:bundle
+pnpm --filter codetime-cli run build:bundle
 
 # ── publish ──
-PUBLISH_ARGS=(--filter codetime publish --access public --tag "$DIST_TAG" --no-git-checks)
+PUBLISH_ARGS=(--filter codetime-cli publish --access public --tag "$DIST_TAG" --no-git-checks)
 if [ "$DRY_RUN" -eq 1 ]; then
   PUBLISH_ARGS+=(--dry-run)
   log "DRY RUN: pnpm ${PUBLISH_ARGS[*]}"
