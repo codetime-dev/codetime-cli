@@ -2,7 +2,8 @@ import type {
   StoredCanonicalEvent,
 } from '../src/index.ts'
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
+// eslint-disable-next-line test/no-import-node-test
+import { it } from 'node:test'
 import {
   AGENT_TIME_SCHEMA_VERSION,
   createImportKey,
@@ -16,7 +17,7 @@ import {
   validateCanonicalEvent,
 } from '../src/index.ts'
 
-test('normalizes canonical events', () => {
+it('normalizes canonical events', () => {
   const event = normalizeCanonicalEvent({
     schemaVersion: '',
     ts: '',
@@ -33,7 +34,7 @@ test('normalizes canonical events', () => {
   assert.equal(event.fileActivities?.length, 1)
 })
 
-test('summarizes canonical file activity without double-counting aggregate metrics', () => {
+it('summarizes canonical file activity without double-counting aggregate metrics', () => {
   const event: StoredCanonicalEvent = {
     id: 'e1',
     receivedAt: '2026-04-29T00:00:00.000Z',
@@ -69,7 +70,7 @@ test('summarizes canonical file activity without double-counting aggregate metri
   assert.equal(summary.bySource.codex, 1)
 })
 
-test('uses aggregate line metrics when file activities do not carry line counts', () => {
+it('uses aggregate line metrics when file activities do not carry line counts', () => {
   const event: StoredCanonicalEvent = {
     id: 'e1',
     receivedAt: '2026-04-29T00:00:00.000Z',
@@ -99,7 +100,7 @@ test('uses aggregate line metrics when file activities do not carry line counts'
   assert.equal(summary.totalLinesRemoved, 1)
 })
 
-test('validates canonical event type and file activity operation at runtime', () => {
+it('validates canonical event type and file activity operation at runtime', () => {
   const validation = validateCanonicalEvent({
     source: 'codex',
     type: 'not.real',
@@ -113,13 +114,13 @@ test('validates canonical event type and file activity operation at runtime', ()
   assert.match(validation.errors.join('\n'), /supported file activity operation/)
 })
 
-test('exposes source capabilities and small shared helpers', () => {
+it('exposes source capabilities and small shared helpers', () => {
   assert.equal(getSourceCapabilities('claude-code').toolCalls, 'exact')
   assert.equal(durationMs('2026-04-29T00:00:00.000Z', '2026-04-29T00:00:01.500Z'), 1500)
   assert.equal(createWorkspaceId({ repoRoot: '/tmp/project' }), createWorkspaceId({ repoRoot: '/tmp/project' }))
 })
 
-test('creates stable import keys, event ids, and payload hashes', () => {
+it('creates stable import keys, event ids, and payload hashes', () => {
   const importKey = createImportKey(['codex', 'source-file', 42])
   const eventId = createStableEventId(importKey)
   const payloadHash = createPayloadHash({

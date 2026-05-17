@@ -646,125 +646,33 @@ async function importBackfillPlan(
     return 1
   }
 
-  const allAdapters = registry.all()
-  const sourceDefs = allAdapters
+  const sourceDefs = registry.all()
     .filter(a => supportedSources.has(a.id) && (source === 'all' || a.id === source))
     .map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home) }))
 
-  // When --force is set, clear the watermark so all files are re-processed,
-  // and purge old rollup data on the server for the target source(s).
   if (options.force) {
-    try {
-      await rm(backfillIncrementalStatePath(home), { force: true })
-    }
-    catch { /* ignore */ }
-
-    for (const item of sourceDefs) {
-      try {
-        const deleted = await deleteSessionRollupsBySourceAPI(item.id, options, ctx)
-        if (!options.json) {
-          write(ctx.stdout, `purged ${item.id}: ${deleted} old rollups\n`)
-        }
-      }
-      catch (error) {
-        debug(ctx, `Failed to purge ${item.id} rollups: ${(error as Error).message}\n`)
-      }
-    }
+    await purgeForcedSources(sourceDefs, home, options, ctx)
   }
 
   const incrementalState = shouldUseIncrementalBackfill(options)
-    ? await readBackfillIncrementalState(home)
+    ? await readBackfillIncrementalState(home, ctx)
     : undefined
-  const selectedFilesBySource = new Map<BackfillSourceId, BackfillSourceFile[]>()
-  const canonicalEvents: CanonicalEvent[] = []
 
   if (!options.json) {
     write(ctx.stdout, `importRun ${plan.importRun.importRunId}\n`)
     write(ctx.stdout, `sources ${sourceDefs.map(s => s.id).join(', ') || 'none'}\n`)
   }
 
-  for (const item of sourceDefs) {
-    const parser = registry.getParser(item.id)
-    if (!parser) {
-      continue
-    }
-    const sourceFiles = await listBackfillSourceFiles(item, options)
-    const selectedFiles = selectBackfillFilesForImport(sourceFiles, incrementalState?.sources[item.id]?.watermarkTs)
-    selectedFilesBySource.set(item.id, selectedFiles)
-    const filePaths = selectedFiles.map(f => f.path)
-    const sourceEvents: CanonicalEvent[] = []
+  const { canonicalEvents, selectedFilesBySource } = await collectCanonicalEvents(
+    sourceDefs,
+    registry,
+    incrementalState,
+    options,
+    ctx,
+  )
 
-    if (options.json) {
-      for (const filePath of filePaths) {
-        const parsed = await parser(filePath, options)
-        for (const event of parsed) {
-          if (matchesBackfillFilters(event, options)) {
-            sourceEvents.push(event)
-          }
-        }
-      }
-    }
-    else {
-      const bar = new ProgressBar(ctx.stdout, `${item.id.padEnd(12)}`)
-      bar.init(filePaths.length, `0 events`)
-      for (let fi = 0; fi < filePaths.length; fi += 1) {
-        const parsed = await parser(filePaths[fi], options)
-        for (const event of parsed) {
-          if (matchesBackfillFilters(event, options)) {
-            sourceEvents.push(event)
-          }
-        }
-        bar.tick(`${fi + 1}/${filePaths.length} files, ${sourceEvents.length} events`)
-      }
-      bar.finalize(`${sourceEvents.length} events`)
-    }
-
-    for (const event of sourceEvents) canonicalEvents.push(event)
-  }
-
-  const counts: BackfillImportCounts = { inserted: 0, skipped: 0, conflicts: 0, failed: 0 }
   const rollups = buildSessionRollups(canonicalEvents)
-  const batchSize = Math.max(1, Math.floor(numberOption(options['batch-size']) || DEFAULT_BACKFILL_BATCH_SIZE))
-  const batchBytes = Math.max(64 * 1024, Math.floor(numberOption(options['batch-bytes']) || DEFAULT_BACKFILL_BATCH_BYTES))
-  // Pre-pack into batches bounded by BOTH count and serialized-byte
-  // size. The byte cap keeps us under nginx's default 1 MiB
-  // `client_max_body_size`; the count cap protects request latency on
-  // tiny rollups. A single rollup that exceeds the byte cap is sent on
-  // its own — the server may 413, surfaced as a batch failure.
-  const batches = packRollupBatches(rollups, batchSize, batchBytes)
-  const totalBatches = batches.length
-
-  let uploadBar: ProgressBar | undefined
-  if (!options.json) {
-    write(ctx.stdout, `rollup ${rollups.length} from ${canonicalEvents.length} events\n`)
-    uploadBar = new ProgressBar(ctx.stdout, `upload`.padEnd(12))
-    uploadBar.init(totalBatches, `0/${totalBatches} batches, 0 inserted`)
-  }
-
-  for (let i = 0; i < batches.length; i += 1) {
-    const batch = batches[i]!
-    const batchNumber = i + 1
-    try {
-      const result = await sendSessionRollupBatch(batch, options, ctx)
-      counts.inserted += result.inserted
-      counts.skipped += result.skipped
-      counts.conflicts += result.conflicts
-      counts.failed += result.failed
-    }
-    catch (error) {
-      debug(ctx, `backfill rollup batch ${batchNumber}/${totalBatches} (${batch.length} rollups) failed: ${(error as Error).message}\n`)
-      counts.failed += batch.length
-    }
-    if (uploadBar) {
-      uploadBar.update(batchNumber, `${batchNumber}/${totalBatches} batches, inserted ${counts.inserted}`)
-    }
-  }
-
-  if (uploadBar) {
-    uploadBar.finalize(`inserted ${counts.inserted} · skipped ${counts.skipped}${
-      counts.conflicts ? ` · conflicts ${counts.conflicts}` : ''
-    }${counts.failed ? ` · failed ${counts.failed}` : ''}`)
-  }
+  const counts = await uploadSessionRollups(rollups, canonicalEvents.length, options, ctx)
 
   const result = {
     importRunId: plan.importRun.importRunId,
@@ -783,6 +691,133 @@ async function importBackfillPlan(
   }
 
   return counts.failed > 0 || (counts.conflicts > 0 && !options['skip-conflicts']) ? 1 : 0
+}
+
+// Clear the local watermark and ask the server to drop existing
+// rollups for each target source. Errors are non-fatal — we surface
+// them via debug and let the import proceed, since the user
+// explicitly asked for --force.
+async function purgeForcedSources(
+  sourceDefs: Array<{ id: BackfillSourceId, label: string, paths: string[] }>,
+  home: string,
+  options: ParsedArgs,
+  ctx: RunContext,
+): Promise<void> {
+  try {
+    // rm({force: true}) already swallows ENOENT, so anything reaching
+    // here is a real I/O / permission problem.
+    await rm(backfillIncrementalStatePath(home), { force: true })
+  }
+  catch (error) {
+    debug(ctx, `Failed to clear backfill watermark: ${(error as Error).message}\n`)
+  }
+
+  for (const item of sourceDefs) {
+    try {
+      const deleted = await deleteSessionRollupsBySourceAPI(item.id, options, ctx)
+      if (!options.json) {
+        write(ctx.stdout, `purged ${item.id}: ${deleted} old rollups\n`)
+      }
+    }
+    catch (error) {
+      debug(ctx, `Failed to purge ${item.id} rollups: ${(error as Error).message}\n`)
+    }
+  }
+}
+
+// Walk each enabled source, run its parser over every file past the
+// recorded watermark, and return the filtered canonical events. Also
+// returns the per-source file lists so callers can advance watermarks
+// once the upload succeeds.
+async function collectCanonicalEvents(
+  sourceDefs: Array<{ id: BackfillSourceId, label: string, paths: string[] }>,
+  registry: AdapterRegistry,
+  incrementalState: BackfillIncrementalState | undefined,
+  options: ParsedArgs,
+  ctx: RunContext,
+): Promise<{
+  canonicalEvents: CanonicalEvent[]
+  selectedFilesBySource: Map<BackfillSourceId, BackfillSourceFile[]>
+}> {
+  const selectedFilesBySource = new Map<BackfillSourceId, BackfillSourceFile[]>()
+  const canonicalEvents: CanonicalEvent[] = []
+
+  for (const item of sourceDefs) {
+    const parser = registry.getParser(item.id)
+    if (!parser) {
+      continue
+    }
+    const sourceFiles = await listBackfillSourceFiles(item, options)
+    const selectedFiles = selectBackfillFilesForImport(sourceFiles, incrementalState?.sources[item.id]?.watermarkTs)
+    selectedFilesBySource.set(item.id, selectedFiles)
+    const filePaths = selectedFiles.map(f => f.path)
+    const sourceEvents: CanonicalEvent[] = []
+
+    const bar = options.json ? undefined : new ProgressBar(ctx.stdout, `${item.id.padEnd(12)}`)
+    bar?.init(filePaths.length, `0 events`)
+    for (let fi = 0; fi < filePaths.length; fi += 1) {
+      const parsed = await parser(filePaths[fi], options)
+      for (const event of parsed) {
+        if (matchesBackfillFilters(event, options)) {
+          sourceEvents.push(event)
+        }
+      }
+      bar?.tick(`${fi + 1}/${filePaths.length} files, ${sourceEvents.length} events`)
+    }
+    bar?.finalize(`${sourceEvents.length} events`)
+
+    for (const event of sourceEvents) canonicalEvents.push(event)
+  }
+
+  return { canonicalEvents, selectedFilesBySource }
+}
+
+// Pre-pack rollups into batches bounded by BOTH count and serialized
+// JSON byte size. The byte cap keeps us under nginx's default 1 MiB
+// `client_max_body_size`; the count cap protects request latency on
+// tiny rollups. A single rollup that exceeds the byte cap is sent on
+// its own — the server may 413, surfaced as a batch failure.
+async function uploadSessionRollups(
+  rollups: SessionRollup[],
+  eventCount: number,
+  options: ParsedArgs,
+  ctx: RunContext,
+): Promise<BackfillImportCounts> {
+  const counts: BackfillImportCounts = { inserted: 0, skipped: 0, conflicts: 0, failed: 0 }
+  const batchSize = Math.max(1, Math.floor(numberOption(options['batch-size']) || DEFAULT_BACKFILL_BATCH_SIZE))
+  const batchBytes = Math.max(64 * 1024, Math.floor(numberOption(options['batch-bytes']) || DEFAULT_BACKFILL_BATCH_BYTES))
+  const batches = packRollupBatches(rollups, batchSize, batchBytes)
+  const totalBatches = batches.length
+
+  let uploadBar: ProgressBar | undefined
+  if (!options.json) {
+    write(ctx.stdout, `rollup ${rollups.length} from ${eventCount} events\n`)
+    uploadBar = new ProgressBar(ctx.stdout, `upload`.padEnd(12))
+    uploadBar.init(totalBatches, `0/${totalBatches} batches, 0 inserted`)
+  }
+
+  for (const [i, batch_] of batches.entries()) {
+    const batch = batch_!
+    const batchNumber = i + 1
+    try {
+      const result = await sendSessionRollupBatch(batch, options, ctx)
+      counts.inserted += result.inserted
+      counts.skipped += result.skipped
+      counts.conflicts += result.conflicts
+      counts.failed += result.failed
+    }
+    catch (error) {
+      debug(ctx, `backfill rollup batch ${batchNumber}/${totalBatches} (${batch.length} rollups) failed: ${(error as Error).message}\n`)
+      counts.failed += batch.length
+    }
+    uploadBar?.update(batchNumber, `${batchNumber}/${totalBatches} batches, inserted ${counts.inserted}`)
+  }
+
+  uploadBar?.finalize(`inserted ${counts.inserted} · skipped ${counts.skipped}${
+    counts.conflicts ? ` · conflicts ${counts.conflicts}` : ''
+  }${counts.failed ? ` · failed ${counts.failed}` : ''}`)
+
+  return counts
 }
 
 function backfillVerifyCommand(options: ParsedArgs, ctx: RunContext): number {
@@ -814,12 +849,7 @@ async function sendSessionRollupBatch(
   options: ParsedArgs,
   ctx: RunContext,
 ): Promise<BackfillImportCounts> {
-  const remote = resolveRemote({
-    apiUrl: stringOption(options['api-url']),
-    token: stringOption(options.token),
-    env: ctx.env,
-    fetch: ctx.fetch,
-  })
+  const remote = resolveRemoteFromOptions(options, ctx)
   if (!remote) {
     throw new Error('No fetch available for HTTP upload')
   }
@@ -847,12 +877,7 @@ async function deleteSessionRollupsBySourceAPI(
   options: ParsedArgs,
   ctx: RunContext,
 ): Promise<number> {
-  const remote = resolveRemote({
-    apiUrl: stringOption(options['api-url']),
-    token: stringOption(options.token),
-    env: ctx.env,
-    fetch: ctx.fetch,
-  })
+  const remote = resolveRemoteFromOptions(options, ctx)
   if (!remote) {
     throw new Error('No fetch available for HTTP delete')
   }
@@ -906,7 +931,9 @@ function packRollupBatches(
     current.push(rollup)
     currentBytes += size
   }
-  if (current.length > 0) batches.push(current)
+  if (current.length > 0) {
+    batches.push(current)
+  }
   return batches
 }
 
@@ -939,9 +966,27 @@ function syncLocalTriggerLockPath(home: string): string {
   return path.join(home, '.codetime', 'sync-local-trigger.lock')
 }
 
-async function readBackfillIncrementalState(home: string): Promise<BackfillIncrementalState> {
-  const state = await readJsonIfExists(backfillIncrementalStatePath(home))
+async function readBackfillIncrementalState(home: string, ctx?: RunContext): Promise<BackfillIncrementalState> {
+  // Corrupt JSON now surfaces from readJsonIfExists; a missing file
+  // resolves to null. Anything else (wrong shape, future schema
+  // version, manual edits that dropped `sources`) lands here and would
+  // previously vanish silently — log via debug so the user can see
+  // when watermarks were dropped.
+  const statePath = backfillIncrementalStatePath(home)
+  const state = await readJsonIfExists(statePath)
+  if (state === null) {
+    return { version: 1, sources: {} }
+  }
   if (!isPlainObject(state) || !isPlainObject(state.sources)) {
+    if (ctx) {
+      debug(ctx, `backfill-state malformed at ${statePath}; ignoring watermarks\n`)
+    }
+    return { version: 1, sources: {} }
+  }
+  if (state.version !== undefined && state.version !== 1) {
+    if (ctx) {
+      debug(ctx, `backfill-state version ${String(state.version)} at ${statePath} is not supported; ignoring watermarks\n`)
+    }
     return { version: 1, sources: {} }
   }
 
@@ -1167,6 +1212,19 @@ function debug(ctx: RunContext, message: string): void {
   }
 }
 
+// Single resolution path for API host + token. Per-command code should
+// not reach into env / options directly — it should call this helper so
+// precedence stays consistent across the CLI.
+function resolveRemoteFromOptions(options: ParsedArgs, ctx: RunContext) {
+  return resolveRemote({
+    apiUrl: stringOption(options['api-url']),
+    token: stringOption(options.token),
+    env: ctx.env,
+    fetch: ctx.fetch,
+    homeOverride: stringOption(options.home),
+  })
+}
+
 // ── token / machine ──
 
 // Mask all but the last 4 chars of a token for display.
@@ -1239,12 +1297,7 @@ async function tokenCommand(
 }
 
 async function machineCommand(action: string | undefined, options: ParsedArgs, ctx: RunContext): Promise<number> {
-  const remote = resolveRemote({
-    apiUrl: stringOption(options['api-url']),
-    token: stringOption(options.token),
-    env: ctx.env,
-    fetch: ctx.fetch,
-  })
+  const remote = resolveRemoteFromOptions(options, ctx)
   if (!remote || !remote.token) {
     write(ctx.stderr, 'machine command requires login (run `codetime login`).\n')
     return 1
@@ -1290,7 +1343,6 @@ async function machineCommand(action: string | undefined, options: ParsedArgs, c
   return 1
 }
 
-
 function write(stream: WritableLike, text: string): void {
   stream.write(text)
 }
@@ -1326,13 +1378,10 @@ Global options:
   --token <token>   Bearer token for this invocation (overrides config).
 
 Token precedence (highest first):
-  --token flag  >  CODETIME_AGENT_TOKEN env  >  AGENT_TIME_API_TOKEN env
-  (legacy alias)  >  saved config (~/.codetime/config.json).
+  --token flag  >  CODETIME_TOKEN env  >  saved config (~/.codetime/config.json).
 
 Environment:
   CODETIME_API_URL        Defaults to ${DEFAULT_API_URL}
-  CODETIME_AGENT_TOKEN    Bearer token for the API
-  AGENT_TIME_API_URL      Legacy alias for CODETIME_API_URL
-  AGENT_TIME_API_TOKEN    Legacy alias for CODETIME_AGENT_TOKEN
+  CODETIME_TOKEN          Bearer token for the API
 `
 }

@@ -3,11 +3,11 @@ name: Publish to npm
 on:
   push:
     tags:
-      - "codetime@*"
+      - 'codetime@*'
   workflow_dispatch:
     inputs:
       tag:
-        description: "npm dist-tag (default: latest)"
+        description: 'npm dist-tag (default: latest)'
         required: false
         default: latest
 
@@ -28,7 +28,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: "https://registry.npmjs.org"
+          registry-url: 'https://registry.npmjs.org'
           cache: pnpm
 
       # npm >= 11.5.1 is required for trusted publishing (OIDC)
