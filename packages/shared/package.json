@@ -2,7 +2,8 @@
   "name": "@codetime/shared",
   "type": "module",
   "version": "0.1.0",
-  "description": "Shared event types for codetime CLI.",
+  "private": true,
+  "description": "Shared event types for codetime CLI. Inlined into the published `codetime` bundle — not published independently.",
   "license": "MIT",
   "exports": {
     ".": {

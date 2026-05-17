@@ -15,7 +15,9 @@
     "hooks:install:plan": "tsx packages/cli/src/main.ts install --dry-run",
     "hooks:link": "pnpm --filter codetime build && cd packages/cli && pnpm link --global --ignore-workspace",
     "hooks:unlink": "cd packages/cli && pnpm unlink --global --ignore-workspace",
-    "test": "pnpm build && pnpm -r --if-present test"
+    "test": "pnpm build && pnpm -r --if-present test",
+    "release": "bash scripts/release.sh",
+    "release:dry": "bash scripts/release.sh --dry"
   },
   "devDependencies": {
     "@jannchie/eslint-config": "^3.7.9",
