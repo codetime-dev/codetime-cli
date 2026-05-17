@@ -1,3 +1,20 @@
+## v0.2.1
+
+[v0.2.0...v0.2.1](https://github.com/codetime-dev/codetime-cli/compare/v0.2.0...v0.2.1)
+
+### :art: Refactors
+
+- **cli**: restructure backfill import flow - By [Jianqi Pan](mailto:jannchie@gmail.com) in [d38a222](https://github.com/codetime-dev/codetime-cli/commit/d38a222)
+
+### :construction_worker: CI
+
+- **github-actions**: add npm publish workflow - By [Jianqi Pan](mailto:jannchie@gmail.com) in [8cab4a2](https://github.com/codetime-dev/codetime-cli/commit/8cab4a2)
+
+### :wrench: Chores
+
+- **cli**: update repository metadata - By [Jianqi Pan](mailto:jannchie@gmail.com) in [2631b76](https://github.com/codetime-dev/codetime-cli/commit/2631b76)
+- **deps**: bump pnpm and lockfile - By [Jianqi Pan](mailto:jannchie@gmail.com) in [e556411](https://github.com/codetime-dev/codetime-cli/commit/e556411)
+
 ## v0.2.0
 
 codetime@0.1.0...v0.2.0
