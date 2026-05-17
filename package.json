@@ -1,0 +1,32 @@
+{
+  "name": "codetime-cli-workspace",
+  "type": "module",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "sync:local": "tsx packages/cli/src/main.ts backfill import --source all",
+    "sync:local:force": "tsx packages/cli/src/main.ts backfill import --source all --force",
+    "sync:local:plan": "tsx packages/cli/src/main.ts backfill plan --source all --dry-run",
+    "hooks:detect": "tsx packages/cli/src/main.ts detect",
+    "hooks:install": "tsx packages/cli/src/main.ts install",
+    "hooks:install:plan": "tsx packages/cli/src/main.ts install --dry-run",
+    "hooks:link": "pnpm --filter codetime build && cd packages/cli && pnpm link --global --ignore-workspace",
+    "hooks:unlink": "cd packages/cli && pnpm unlink --global --ignore-workspace",
+    "test": "pnpm build && pnpm -r --if-present test"
+  },
+  "devDependencies": {
+    "@jannchie/eslint-config": "^3.7.9",
+    "@types/node": "^25.8.0",
+    "eslint": "^10.4.0",
+    "tsx": "^4.22.1",
+    "typescript": "^6.0.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

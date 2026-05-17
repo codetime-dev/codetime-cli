@@ -1,0 +1,46 @@
+{
+  "name": "codetime",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "codetime CLI — install AI-agent hooks (Claude Code, Codex, OpenCode, Pi) and report activity to codetime.dev.",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/jannchie/codetime-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jannchie/codetime-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jannchie/codetime-cli/issues"
+  },
+  "keywords": [
+    "codetime",
+    "ai",
+    "agent",
+    "cli",
+    "tracking",
+    "activity"
+  ],
+  "bin": {
+    "codetime": "./bin/codetime.mjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:bundle": "node bundle.mjs",
+    "prepublishOnly": "node bundle.mjs",
+    "test": "node --conditions=development --test --import tsx test/*.test.ts"
+  },
+  "devDependencies": {
+    "@codetime/shared": "workspace:*",
+    "cac": "^7.0.0",
+    "esbuild": "^0.28.0"
+  }
+}
