@@ -60,7 +60,7 @@ fi
 
 # ── precondition: tag must not already exist on the remote ──
 VERSION="$(node -p "require('$CLI_DIR/package.json').version")"
-TAG="codetime@${VERSION}"
+TAG="v${VERSION}"
 log "release version: $VERSION (dist-tag: $DIST_TAG)"
 
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
@@ -95,7 +95,7 @@ fi
 
 # ── tag + push ──
 log "tagging $TAG"
-git tag -a "$TAG" -m "codetime@${VERSION}"
+git tag -a "$TAG" -m "v${VERSION}"
 git push origin main --follow-tags
 
 log "done. published codetime@${VERSION}"
