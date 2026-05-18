@@ -43,6 +43,7 @@ editor time also tracks your agent time.
 | Codex CLI | `codex` | `~/.codex/sessions/**` |
 | OpenCode | `opencode` | `~/.local/share/opencode/**` |
 | Pi | `pi` | `~/.pi/sessions/**` |
+| Amp | `amp` | `~/.local/share/amp/threads/**` (backfill only) |
 
 ## Install
 
@@ -103,7 +104,7 @@ that leave your machine.
 
 **Session shape** (per agent session)
 
-- Agent name (`claude` / `codex` / `opencode` / `pi`), session id,
+- Agent name (`claude` / `codex` / `opencode` / `pi` / `amp`), session id,
   turn ids, timestamps, durations.
 - Workspace / project name — typically the basename of the working
   directory the agent was launched in (e.g. `codetime-cli`).

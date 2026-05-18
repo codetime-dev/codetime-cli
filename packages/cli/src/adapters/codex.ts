@@ -36,6 +36,8 @@ async function parseCodexSessionFile(
   const text = await readFile(filePath, 'utf8')
   const lines = text.split('\n').filter(Boolean)
   const sourcePathHash = `sha256:${createStableHash(filePath)}`
+  // service_tier=fast|priority encoded into model name (see rewriteCodexModelForTier).
+  const serviceTier = await resolveCodexServiceTier(filePath)
   const events: CanonicalEvent[] = []
   let sessionId = sessionIdFromFilePath(filePath, 'codex')
   let cwd: string | undefined
@@ -186,7 +188,10 @@ async function parseCodexSessionFile(
             turnId: currentTurnId,
             cwd,
             project,
-            model,
+            // Only the model.usage event carries the -fast suffix; tool and
+            // turn events keep the bare model so other queries (e.g. "what
+            // model was the user on") don't show tier-specific names.
+            model: rewriteCodexModelForTier(model, serviceTier),
             confidence: 'partial',
             metrics: usage,
           }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
@@ -393,6 +398,67 @@ async function parseCodexSessionFile(
 }
 
 // ── Codex-specific helpers ──
+
+// Module-level cache: a single backfill run touches many session files under
+// the same CODEX_HOME — read config.toml once per home, not per file.
+const codexServiceTierCache = new Map<string, string | null>()
+
+async function resolveCodexServiceTier(sessionFilePath: string): Promise<string | undefined> {
+  const home = inferCodexHomeFromSessionPath(sessionFilePath)
+  if (!home) {
+    return undefined
+  }
+  if (!codexServiceTierCache.has(home)) {
+    codexServiceTierCache.set(home, await readCodexServiceTier(home))
+  }
+  return codexServiceTierCache.get(home) ?? undefined
+}
+
+// Codex session files live at <CODEX_HOME>/sessions/<...>/<file>.jsonl or
+// <CODEX_HOME>/history.jsonl. Walk parents until we hit the `sessions/` segment
+// or land on the history file's parent — either points at CODEX_HOME.
+function inferCodexHomeFromSessionPath(sessionFilePath: string): string | undefined {
+  if (path.basename(sessionFilePath) === 'history.jsonl') {
+    return path.dirname(sessionFilePath)
+  }
+  let dir = path.dirname(sessionFilePath)
+  for (let depth = 0; depth < 10; depth += 1) {
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      return undefined
+    }
+    if (path.basename(dir) === 'sessions') {
+      return parent
+    }
+    dir = parent
+  }
+  return undefined
+}
+
+async function readCodexServiceTier(codexHomePath: string): Promise<string | null> {
+  try {
+    const text = await readFile(path.join(codexHomePath, 'config.toml'), 'utf8')
+    // Match `service_tier = "fast"` / `service_tier='priority'` / `service_tier=fast`
+    // anywhere in the file. ccusage uses a similar regex for the same purpose.
+    const match = text.match(/(?:^|\n)\s*service_tier\s*=\s*["']?([a-z_]+)["']?/i)
+    return match ? match[1].toLowerCase() : null
+  }
+  catch {
+    return null
+  }
+}
+
+// Codex's fast/priority service_tier costs ~2× standard. Like Claude Code's
+// `-fast` Opus suffix, we encode the tier into the model name so the backend
+// pricing table (which keys on model only) resolves to the tier-specific
+// entry without plumbing extra fields through SessionModelRollup.
+function rewriteCodexModelForTier(model: string | undefined, serviceTier: string | undefined): string | undefined {
+  if (!model) {
+    return model
+  }
+  const isFastTier = serviceTier === 'fast' || serviceTier === 'priority'
+  return isFastTier ? `${model}-fast` : model
+}
 
 function baseCodexEvent(
   event: Omit<CanonicalEvent, 'schemaVersion' | 'source' | 'agent' | 'workspaceId'>,

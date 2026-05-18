@@ -17,16 +17,15 @@ import {
   createImportKey,
   createPayloadHash,
   createStableHash,
-  validateCanonicalEvent,
 } from '@codetime/shared'
 import { cac } from 'cac'
-import { claudeUsageFromMessage, createClaudeCodeAdapter } from './adapters/claude-code.js'
-import { createCodexAdapter, tokenUsageFromPayload } from './adapters/codex.js'
+import { ampBackfillFiles, createAmpAdapter } from './adapters/amp.js'
+import { createClaudeCodeAdapter } from './adapters/claude-code.js'
+import { createCodexAdapter } from './adapters/codex.js'
 import { createOpenCodeAdapter, opencodeBackfillFiles } from './adapters/opencode.js'
 import { createPiAdapter } from './adapters/pi.js'
 import { AdapterRegistry } from './adapters/registry.js'
 import { buildSessionRollups } from './backfill/rollup.js'
-import { enrichFromTranscript, hookEventsFromPayload } from './hooks/dispatch.js'
 import { installEntry } from './install/manager.js'
 import { matchesBackfillFilters } from './lib/backfill.js'
 import { defaultMachineName, ensureLocalMachineId, readConfig, writeConfig } from './lib/config.js'
@@ -53,6 +52,7 @@ function createRegistry(): AdapterRegistry {
   registry.register(createClaudeCodeAdapter())
   registry.register(createPiAdapter())
   registry.register(createOpenCodeAdapter())
+  registry.register(createAmpAdapter())
   return registry
 }
 
@@ -272,7 +272,7 @@ async function installCommand(options: ParsedArgs, ctx: RunContext, registry: Ad
       : detected
 
   if (selectedIds.length === 0) {
-    write(ctx.stderr, 'No supported local targets were detected. Use --target codex,claude,opencode,pi or --all to create them.\n')
+    write(ctx.stderr, 'No supported local targets were detected. Use --target codex,claude,opencode,pi,amp or --all to create them.\n')
     return 1
   }
 
@@ -289,17 +289,26 @@ async function installCommand(options: ParsedArgs, ctx: RunContext, registry: Ad
   return 0
 }
 
+// The hook command is a thin trigger: it drains stdin so the upstream agent
+// doesn't block on a closed pipe, then schedules a local backfill run.
+// Backfill's mtime watermark and per-adapter parsers do all the real work
+// (model.usage assembly, token dedup, service_tier rewrites, etc.) — keeping
+// the hook side reactive but stateless avoids two copies of every parser.
 async function hookCommand(options: ParsedArgs, ctx: RunContext): Promise<number> {
   const home = resolveHome(options, ctx)
   try {
     const agent = requiredOption(options, 'agent')
     const payload = await readHookPayload(ctx.stdin)
-    const enrichment = await enrichFromTranscript(payload, claudeUsageFromMessage)
-    const events = hookEventsFromPayload(agent, payload, options, enrichment, { tokenUsageFromPayload })
-    assertValidEvents(events)
 
     if (options['dry-run']) {
-      write(ctx.stdout, `${JSON.stringify(events.length === 1 ? events[0] : events, null, 2)}\n`)
+      // Echo the raw payload so users debugging hook wiring can see exactly
+      // what the agent forwarded. No event assembly, no cost estimate —
+      // those happen on the backfill side.
+      write(ctx.stdout, `${JSON.stringify({
+        agent,
+        received: payload,
+        wouldTrigger: 'backfill',
+      }, null, 2)}\n`)
       return 0
     }
 
@@ -592,6 +601,9 @@ async function listBackfillSourceFiles(
 ): Promise<BackfillSourceFile[]> {
   if (source.id === 'opencode') {
     return opencodeBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+  }
+  if (source.id === 'amp') {
+    return ampBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
   }
 
   const roots = stringOption(options['source-root'])
@@ -1069,7 +1081,7 @@ async function readBackfillIncrementalState(home: string, ctx?: RunContext): Pro
   }
 
   const sources: BackfillIncrementalState['sources'] = {}
-  for (const source of ['codex', 'claude-code', 'opencode', 'pi'] as const) {
+  for (const source of ['codex', 'claude-code', 'opencode', 'pi', 'amp'] as const) {
     const item = state.sources[source]
     if (isPlainObject(item) && typeof item.watermarkTs === 'string' && !Number.isNaN(Date.parse(item.watermarkTs))) {
       sources[source] = { watermarkTs: item.watermarkTs }
@@ -1246,17 +1258,6 @@ function requiredOption(options: ParsedArgs, name: string): string {
     throw new Error(`Missing required option: --${name}`)
   }
   return value
-}
-
-function assertValidEvent(event: CanonicalEvent): void {
-  const validation = validateCanonicalEvent(event)
-  if (!validation.valid) {
-    throw new Error(`Invalid event: ${validation.errors.join('; ')}`)
-  }
-}
-
-function assertValidEvents(events: CanonicalEvent[]): void {
-  for (const event of events) assertValidEvent(event)
 }
 
 async function readHookPayload(stdin: AsyncIterable<unknown> & { isTTY?: boolean }): Promise<Record<string, unknown>> {

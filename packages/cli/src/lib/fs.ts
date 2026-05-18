@@ -74,6 +74,13 @@ export async function writeGeneratedFile(
 }
 
 export async function listJsonlFiles(rootPath: string): Promise<string[]> {
+  return listFilesByExtensions(rootPath, ['.jsonl'])
+}
+
+export async function listFilesByExtensions(
+  rootPath: string,
+  extensions: readonly string[],
+): Promise<string[]> {
   let info
   try {
     info = await stat(rootPath)
@@ -86,7 +93,7 @@ export async function listJsonlFiles(rootPath: string): Promise<string[]> {
   }
 
   if (info.isFile()) {
-    return rootPath.endsWith('.jsonl') ? [rootPath] : []
+    return extensions.some(ext => rootPath.endsWith(ext)) ? [rootPath] : []
   }
   if (!info.isDirectory()) {
     return []
@@ -96,9 +103,9 @@ export async function listJsonlFiles(rootPath: string): Promise<string[]> {
   const files = await Promise.all(entries.map(async (entry) => {
     const entryPath = path.join(rootPath, entry.name)
     if (entry.isDirectory()) {
-      return listJsonlFiles(entryPath)
+      return listFilesByExtensions(entryPath, extensions)
     }
-    return entry.isFile() && entry.name.endsWith('.jsonl') ? [entryPath] : []
+    return entry.isFile() && extensions.some(ext => entry.name.endsWith(ext)) ? [entryPath] : []
   }))
 
   return files.flat().sort()
@@ -111,6 +118,9 @@ export async function countDirectoryEntries(candidatePath: string): Promise<numb
       if (candidatePath.endsWith('.jsonl')) {
         const text = await readFile(candidatePath, 'utf8')
         return text.split('\n').filter(Boolean).length
+      }
+      if (candidatePath.endsWith('.json')) {
+        return 1
       }
       if (candidatePath.endsWith('.db')) {
         try {
@@ -132,7 +142,9 @@ export async function countDirectoryEntries(candidatePath: string): Promise<numb
       }
       return 1
     }
-    const files = await listJsonlFiles(candidatePath)
+    // Count both .jsonl (codex/claude/pi sessions) and .json (Amp threads)
+    // so adapters with different on-disk formats both surface accurate counts.
+    const files = await listFilesByExtensions(candidatePath, ['.jsonl', '.json'])
     return files.length
   }
   catch (error) {

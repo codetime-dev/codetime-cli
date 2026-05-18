@@ -9,6 +9,7 @@ export const KNOWN_AGENT_SOURCES = [
   'cursor',
   'opencode',
   'pi',
+  'amp',
   'generic-cli',
   'manual',
   'unknown',
@@ -113,6 +114,24 @@ export const SOURCE_CAPABILITIES: Record<KnownAgentSource, SourceCapabilities> =
     fileReads: 'partial',
     fileWrites: 'partial',
     fileDiffStats: 'partial',
+    permissionEvents: 'none',
+    transcriptLocator: 'exact',
+  },
+  // Amp keeps a per-thread JSON with a ledger of usage events; only token
+  // accounting is exposed locally, no tool/file/cwd telemetry.
+  'amp': {
+    sessionLifecycle: 'derived',
+    turnLifecycle: 'none',
+    agentHierarchy: 'none',
+    promptEvents: 'none',
+    modelName: 'exact',
+    tokenUsage: 'exact',
+    toolCalls: 'none',
+    toolTiming: 'none',
+    commandTiming: 'none',
+    fileReads: 'none',
+    fileWrites: 'none',
+    fileDiffStats: 'none',
     permissionEvents: 'none',
     transcriptLocator: 'exact',
   },
@@ -290,7 +309,7 @@ export interface StoredCanonicalEvent extends CanonicalEvent {
   receivedAt: string
 }
 
-export type BackfillSourceId = 'codex' | 'claude-code' | 'cursor' | 'opencode' | 'pi'
+export type BackfillSourceId = 'codex' | 'claude-code' | 'cursor' | 'opencode' | 'pi' | 'amp'
 export type ImportRunStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ImportRunRecord {

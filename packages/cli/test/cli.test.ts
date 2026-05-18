@@ -5,6 +5,7 @@ import path from 'node:path'
 import { Readable } from 'node:stream'
 // eslint-disable-next-line test/no-import-node-test -- This repo uses node:test as the runner.
 import { test } from 'node:test'
+import { createCodexAdapter } from '../src/adapters/codex.ts'
 import { run, syncLocalRunnerEntryArgs } from '../src/cli.ts'
 
 test('detect reports installed Codex hook', async () => {
@@ -59,7 +60,10 @@ test('install writes Codex hook without a skill', async () => {
   assert.equal(hooks.hooks.Stop[0].hooks[0].command, 'codetime hook --agent codex')
 })
 
-test('hook converts apply_patch payload without leaking patch contents', async () => {
+test('hook triggers a sync-local-runner without parsing the payload', async () => {
+  // Verifies the trigger contract: the hook spawns sync-local-runner (the
+  // real upload path) and persists state/lock files. Payload contents are
+  // not inspected — backfill re-derives all events from session files.
   const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
   const spawns: Array<{ command: string, args: string[] }> = []
   const stdin = Readable.from([JSON.stringify({
@@ -67,15 +71,6 @@ test('hook converts apply_patch payload without leaking patch contents', async (
     tool_name: 'apply_patch',
     cwd: path.join(home, 'project'),
     session_id: 's1',
-    tool_input: {
-      patch: [
-        '*** Begin Patch',
-        '*** Update File: src/secret.ts',
-        '+const token = \'secret\'',
-        '-const token = \'\'',
-        '*** End Patch',
-      ].join('\n'),
-    },
   })])
 
   const exitCode = await run(['hook', '--agent', 'codex', '--home', home], testContext({
@@ -88,16 +83,40 @@ test('hook converts apply_patch payload without leaking patch contents', async (
 
   assert.equal(exitCode, 0)
   assert.equal(spawns.length, 1)
-  assert.equal(spawns[0].command.length > 0, true)
   assert.equal(spawns[0].args.includes('sync-local-runner'), true)
-  assert.equal(spawns[0].args.includes('--source'), false)
-  assert.equal(spawns[0].args[0], '--import')
-  assert.equal(spawns[0].args[1], 'tsx')
-  assert.match(spawns[0].args[2], /src\/cli\.ts$/)
   const state = JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.json'), 'utf8'))
   const lock = JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.lock'), 'utf8'))
   assert.equal(typeof state.lastTriggeredAt, 'string')
   assert.equal(lock.pid, 43_210)
+})
+
+test('hook --dry-run echoes the payload without triggering backfill', async () => {
+  const spawns: number[] = []
+  const stdin = Readable.from([JSON.stringify({
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Read',
+    tool_input: { file_path: 'src/index.ts' },
+  })])
+  let output = ''
+
+  const exitCode = await run(['hook', '--agent', 'claude', '--dry-run'], testContext({
+    stdin,
+    spawn: () => {
+      spawns.push(1)
+      return { pid: 1, unref() {} } as never
+    },
+    stdout: { write: (text) => {
+      output += text
+    } },
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(spawns.length, 0, 'dry-run must not spawn anything')
+  const result = JSON.parse(output)
+  assert.equal(result.agent, 'claude')
+  assert.equal(result.wouldTrigger, 'backfill')
+  assert.equal(result.received.hook_event_name, 'PostToolUse')
+  assert.equal(result.received.tool_name, 'Read')
 })
 
 test('sync-local-runner entry args use the bin entrypoint for built output', () => {
@@ -109,58 +128,6 @@ test('sync-local-runner entry args use the bin entrypoint for built output', () 
   assert.deepEqual(syncLocalRunnerEntryArgs('/repo/packages/cli/dist/cli.js'), [
     '/repo/packages/cli/bin/codetime.mjs',
   ])
-})
-
-test('hook maps read tools to file.read activity', async () => {
-  const stdin = Readable.from([JSON.stringify({
-    hook_event_name: 'PostToolUse',
-    tool_name: 'Read',
-    tool_input: {
-      file_path: 'src/index.ts',
-    },
-  })])
-  let output = ''
-
-  const exitCode = await run(['hook', '--agent', 'claude', '--dry-run'], testContext({
-    stdin,
-    stdout: { write: (text) => {
-      output += text
-    } },
-  }))
-
-  assert.equal(exitCode, 0)
-  const events = JSON.parse(output)
-  assert.equal(Array.isArray(events), true)
-  assert.equal(events[0].source, 'claude-code')
-  assert.equal(events.some((event: { type: string }) => event.type === 'tool.completed'), true)
-  const fileRead = events.find((event: { type: string }) => event.type === 'file.read')
-  assert.ok(fileRead)
-  assert.equal(fileRead.fileActivities[0].operation, 'read')
-})
-
-test('hook maps search tools to file.searched activity', async () => {
-  const stdin = Readable.from([JSON.stringify({
-    hook_event_name: 'PostToolUse',
-    tool_name: 'Grep',
-    tool_input: {
-      path: 'src',
-    },
-  })])
-  let output = ''
-
-  const exitCode = await run(['hook', '--agent', 'claude', '--dry-run'], testContext({
-    stdin,
-    stdout: { write: (text) => {
-      output += text
-    } },
-  }))
-
-  assert.equal(exitCode, 0)
-  const events = JSON.parse(output)
-  assert.equal(Array.isArray(events), true)
-  const fileSearched = events.find((event: { type: string }) => event.type === 'file.searched')
-  assert.ok(fileSearched)
-  assert.equal(fileSearched.fileActivities[0].operation, 'search')
 })
 
 test('sync-local-trigger throttles repeated triggers', async () => {
@@ -231,119 +198,6 @@ test('sync-local-runner honors explicit state and lock file paths', async () => 
   assert.equal(typeof state.lastCompletedAt, 'string')
   assert.equal(state.lastExitCode, 0)
   await assert.rejects(readFile(lockPath, 'utf8'), { code: 'ENOENT' })
-})
-
-test('hook Stop reads transcript usage up to the previous user prompt', async () => {
-  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
-  const transcriptPath = path.join(home, 'transcript.jsonl')
-  const transcript = [
-    { type: 'user', message: { role: 'user', content: 'earlier prompt' } },
-    {
-      type: 'assistant',
-      message: {
-        id: 'msg_a',
-        role: 'assistant',
-        model: 'claude-opus-4-7',
-        content: [],
-        usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
-      },
-    },
-    { type: 'user', message: { role: 'user', content: 'current prompt' } },
-    {
-      type: 'assistant',
-      message: {
-        id: 'msg_b',
-        role: 'assistant',
-        model: 'claude-opus-4-7',
-        content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/foo' } }],
-        usage: { input_tokens: 2000, output_tokens: 80, cache_read_input_tokens: 1500 },
-      },
-    },
-    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } },
-    {
-      type: 'assistant',
-      message: {
-        id: 'msg_c',
-        role: 'assistant',
-        model: 'claude-opus-4-7',
-        content: [],
-        usage: { input_tokens: 2100, output_tokens: 120, cache_read_input_tokens: 2000 },
-      },
-    },
-  ].map(item => JSON.stringify(item)).join('\n')
-  await writeFile(transcriptPath, transcript, 'utf8')
-
-  const stdin = Readable.from([JSON.stringify({
-    hook_event_name: 'Stop',
-    session_id: 's1',
-    cwd: home,
-    transcript_path: transcriptPath,
-  })])
-  let output = ''
-
-  const exitCode = await run(['hook', '--agent', 'claude', '--dry-run'], testContext({
-    stdin,
-    stdout: { write: (text) => {
-      output += text
-    } },
-  }))
-
-  assert.equal(exitCode, 0)
-  const events = JSON.parse(output)
-  const turn = events.find((event: { type: string }) => event.type === 'turn.completed')
-  const usage = events.find((event: { type: string }) => event.type === 'model.usage')
-  assert.ok(turn)
-  assert.ok(usage)
-  assert.equal(turn.model, 'claude-opus-4-7')
-  assert.equal(turn.metrics.modelCalls, 2)
-  assert.equal(turn.metrics.tokensInput, 7600)
-  assert.equal(turn.metrics.tokensCacheReadInput, 3500)
-  assert.equal(turn.metrics.tokensOutput, 200)
-  assert.equal(usage.refs.messageId, 'msg_c')
-  // costUsd is left for server-side computation now — see pricing.ts.
-  assert.equal(usage.metrics.costUsd, undefined)
-})
-
-test('hook PostToolUse forwards Codex info.last_token_usage as model.usage', async () => {
-  const stdin = Readable.from([JSON.stringify({
-    hook_event_name: 'PostToolUse',
-    tool_name: 'Bash',
-    cwd: tmpdir(),
-    session_id: 'cx',
-    model: 'gpt-5.1-codex',
-    duration_ms: 820,
-    tool_input: { command: 'ls' },
-    info: {
-      last_token_usage: {
-        input_tokens: 1500,
-        cached_input_tokens: 1000,
-        output_tokens: 40,
-        reasoning_output_tokens: 12,
-        total_tokens: 1552,
-      },
-      model_context_window: 272_000,
-    },
-  })])
-  let output = ''
-
-  const exitCode = await run(['hook', '--agent', 'codex', '--dry-run'], testContext({
-    stdin,
-    stdout: { write: (text) => {
-      output += text
-    } },
-  }))
-
-  assert.equal(exitCode, 0)
-  const events = JSON.parse(output)
-  const usage = events.find((event: { type: string }) => event.type === 'model.usage')
-  assert.ok(usage)
-  assert.equal(usage.model, 'gpt-5.1-codex')
-  assert.equal(usage.metrics.tokensInput, 1500)
-  assert.equal(usage.metrics.tokensReasoningOutput, 12)
-  assert.equal(usage.metrics.modelContextWindow, 272_000)
-  assert.equal(usage.metrics.modelDurationMs, 820)
-  // costUsd is left for server-side computation now — see pricing.ts.
-  assert.equal(usage.metrics.costUsd, undefined)
 })
 
 test('backfill dry-run reports local history candidates without importing', async () => {
@@ -1393,6 +1247,166 @@ test('OPENCODE_CONFIG_DIR relocates OpenCode install path', async () => {
   assert.equal(exitCode, 0)
   const plugin = await readFile(path.join(opencodeDir, 'plugins', 'codetime.mjs'), 'utf8')
   assert.match(plugin, /codetime hook --agent opencode/)
+})
+
+const SAMPLE_CODEX_SESSION = [
+  JSON.stringify({ timestamp: '2026-05-13T09:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5-codex' } }),
+  JSON.stringify({
+    timestamp: '2026-05-13T09:01:00.000Z',
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: {
+        model: 'gpt-5-codex',
+        last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+        total_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+      },
+    },
+  }),
+].join('\n')
+
+test('codex parser appends -fast to model when config.toml has service_tier="fast"', async () => {
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+  const sessionsDir = path.join(codexHome, 'sessions', 'p')
+  await mkdir(sessionsDir, { recursive: true })
+  await writeFile(path.join(codexHome, 'config.toml'), 'model = "gpt-5-codex"\nservice_tier = "fast"\n', 'utf8')
+  const sessionPath = path.join(sessionsDir, 'session.jsonl')
+  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+
+  const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
+  const usage = events.filter(event => event.type === 'model.usage')
+  assert.ok(usage.length > 0, 'expected at least one model.usage')
+  for (const event of usage) {
+    assert.equal(event.model, 'gpt-5-codex-fast')
+  }
+})
+
+test('codex parser maps service_tier="priority" to the -fast model variant', async () => {
+  // Codex's "priority" is the second flavor of fast inference; ccusage maps both
+  // to its single "fast" speed bucket. We do the same so backend pricing stays simple.
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+  const sessionsDir = path.join(codexHome, 'sessions', 'p')
+  await mkdir(sessionsDir, { recursive: true })
+  await writeFile(path.join(codexHome, 'config.toml'), 'service_tier = "priority"\n', 'utf8')
+  const sessionPath = path.join(sessionsDir, 'session.jsonl')
+  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+
+  const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
+  const usage = events.filter(event => event.type === 'model.usage')
+  assert.ok(usage.length > 0)
+  for (const event of usage) {
+    assert.equal(event.model, 'gpt-5-codex-fast')
+  }
+})
+
+test('codex parser keeps bare model name when config.toml omits service_tier', async () => {
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+  const sessionsDir = path.join(codexHome, 'sessions', 'p')
+  await mkdir(sessionsDir, { recursive: true })
+  // config.toml exists but has no service_tier — must NOT append -fast.
+  await writeFile(path.join(codexHome, 'config.toml'), 'model = "gpt-5-codex"\n', 'utf8')
+  const sessionPath = path.join(sessionsDir, 'session.jsonl')
+  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+
+  const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
+  const usage = events.filter(event => event.type === 'model.usage')
+  assert.ok(usage.length > 0)
+  for (const event of usage) {
+    assert.equal(event.model, 'gpt-5-codex')
+  }
+})
+
+test('codex parser handles missing config.toml gracefully', async () => {
+  // No config.toml at all — common when CODEX_HOME is fresh.
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+  const sessionsDir = path.join(codexHome, 'sessions', 'p')
+  await mkdir(sessionsDir, { recursive: true })
+  const sessionPath = path.join(sessionsDir, 'session.jsonl')
+  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+
+  const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
+  const usage = events.filter(event => event.type === 'model.usage')
+  for (const event of usage) {
+    assert.equal(event.model, 'gpt-5-codex')
+  }
+})
+
+test('AMP_DATA_DIR relocates Amp detect and source paths', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const ampDir = await mkdtemp(path.join(tmpdir(), 'amp-data-'))
+
+  const targets = await detectTargets(home, { AMP_DATA_DIR: ampDir })
+  assert.equal(targets.amp.detectPath, ampDir)
+  assert.equal(targets.amp.installedPath, path.join(ampDir, 'threads'))
+
+  // Amp has no plugin/hook surface, so install is a no-op but must succeed.
+  const exitCode = await run(['install', '--target', 'amp', '--home', home], testContext({
+    env: { HOME: home, AMP_DATA_DIR: ampDir },
+  }))
+  assert.equal(exitCode, 0)
+})
+
+test('backfill plan parses Amp thread JSON into model.usage events with cache tokens', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const ampDir = await mkdtemp(path.join(tmpdir(), 'amp-data-'))
+  const threadsDir = path.join(ampDir, 'threads')
+  await mkdir(threadsDir, { recursive: true })
+
+  const thread = {
+    id: 'T_abc',
+    messages: [
+      { role: 'user', messageId: 0 },
+      {
+        role: 'assistant',
+        messageId: 1,
+        usage: { cacheCreationInputTokens: 200, cacheReadInputTokens: 50 },
+      },
+    ],
+    usageLedger: {
+      events: [
+        {
+          timestamp: '2026-05-18T10:00:00.000Z',
+          model: 'anthropic/claude-sonnet-4-5',
+          credits: 12.5,
+          tokens: { input: 1000, output: 300 },
+          operationType: 'inference',
+          fromMessageId: 0,
+          toMessageId: 1,
+        },
+      ],
+    },
+  }
+  await writeFile(path.join(threadsDir, 'thread_abc.json'), JSON.stringify(thread), 'utf8')
+
+  let output = ''
+  const exitCode = await run([
+    'backfill',
+    'plan',
+    '--source',
+    'amp',
+    '--home',
+    home,
+    '--json',
+    '--include-source-path',
+  ], testContext({
+    env: { HOME: home, AMP_DATA_DIR: ampDir },
+    stdout: { write: (text: string) => {
+      output += text
+    } },
+  }))
+  assert.equal(exitCode, 0)
+  const plan = JSON.parse(output)
+  const ampCandidate = plan.candidates.find((c: { source: string }) => c.source === 'amp')
+  assert.ok(ampCandidate, 'expected an amp backfill candidate')
+  assert.equal(ampCandidate.path, threadsDir)
+  assert.equal(ampCandidate.exists, true)
+  assert.equal(ampCandidate.entries, 1)
+
+  const ampPlanned = plan.plannedEvents.filter((e: { source: string }) => e.source === 'amp')
+  const modelUsage = ampPlanned.filter((e: { type: string }) => e.type === 'model.usage')
+  assert.equal(modelUsage.length, 1, `expected one model.usage from Amp thread, got: ${JSON.stringify(ampPlanned)}`)
+  assert.equal(ampPlanned.some((e: { type: string }) => e.type === 'session.started'), true)
+  assert.equal(ampPlanned.some((e: { type: string }) => e.type === 'session.ended'), true)
 })
 
 test('XDG_DATA_HOME relocates OpenCode backfill source candidates', async () => {
