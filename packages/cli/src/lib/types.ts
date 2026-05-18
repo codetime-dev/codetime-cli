@@ -27,8 +27,17 @@ export interface BackfillSourceFile {
   modifiedAt: string
 }
 
+// Bump `BACKFILL_STATE_SCHEMA_VERSION` whenever the offline parsers
+// change in a way that invalidates already-uploaded rollups (e.g. the
+// Claude assistant-message dedup added in v2). The CLI compares the
+// constant against the on-disk schema; on a mismatch it drops every
+// watermark so the next sync silently re-parses all jsonl from scratch
+// and upserts the deduped rollups (`replace: true` is already set).
+// Users get the fix transparently the next time their agent runs.
+export const BACKFILL_STATE_SCHEMA_VERSION = 2
+
 export interface BackfillIncrementalState {
-  version: 1
+  version: typeof BACKFILL_STATE_SCHEMA_VERSION
   sources: Partial<Record<
     import('@codetime/shared').BackfillSourceId,
     { watermarkTs: string }

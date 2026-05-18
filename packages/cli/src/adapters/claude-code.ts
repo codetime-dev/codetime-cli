@@ -53,6 +53,11 @@ async function parseClaudeCodeSessionFile(
   const lines = text.split('\n').filter(Boolean)
   const projectContext = await claudeProjectContextFromLines(filePath, lines, options)
   const pendingTools = new Map<string, ClaudePendingTool>()
+  // Claude Code occasionally writes the same assistant message to the
+  // jsonl more than once (streaming flushes, retries, replays). ccusage
+  // dedups by `${messageId}:${requestId}` — without it codetime double-
+  // counts tokens 2-6×. Track which usage rows we've already emitted.
+  const seenUsageKeys = new Set<string>()
   let sessionId = sessionIdFromFilePath(filePath, 'claude')
   let cwd: string | undefined
   let project: string | undefined = projectContext.project
@@ -221,8 +226,29 @@ async function parseClaudeCodeSessionFile(
     }
 
     model = stringField(message, 'model') || model
+    // Skip the entire assistant entry when (messageId, requestId) was
+    // already processed — applies to both the usage metrics and any
+    // tool_use items so we don't double-emit tool.started either.
+    // When messageId is absent we cannot dedup safely — emit and accept
+    // the risk (matches ccusage's createUniqueHash returning null).
+    const messageId = stringField(message, 'id')
+    const requestId = stringField(raw, 'requestId')
+    const usageKey = messageId ? `${messageId}:${requestId}` : null
+    if (usageKey != null && seenUsageKeys.has(usageKey)) {
+      continue
+    }
+    if (usageKey != null) {
+      seenUsageKeys.add(usageKey)
+    }
     const usage = claudeUsageFromMessage(message)
     if (usage) {
+      // Anthropic surfaces fast inference via `usage.speed === 'fast'`.
+      // Append `-fast` so the model name lines up with OpenRouter's
+      // separate `anthropic/claude-opus-4.7-fast` pricing entry (~6×
+      // standard). Tag only the model.usage event to keep downstream
+      // tool events on the base model name.
+      const speed = stringField(objectField(message, 'usage'), 'speed')
+      const usageModel = speed === 'fast' && model ? `${model}-fast` : model
       push(baseClaudeEvent({
         ts,
         type: 'model.usage',
@@ -230,7 +256,7 @@ async function parseClaudeCodeSessionFile(
         turnId: state.currentTurnId,
         cwd,
         project,
-        model,
+        model: usageModel,
         confidence: 'partial',
         metrics: usage,
       }), lineNumber, topType, 'usage')

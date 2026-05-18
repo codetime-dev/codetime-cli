@@ -7,6 +7,7 @@ import type {
 } from '@codetime/shared'
 import type { BackfillSourceDefinition } from './lib/backfill.js'
 import type { BackfillImportCounts, BackfillIncrementalState, BackfillSourceFile, ParsedArgs, RunContext, SyncLocalLock, SyncLocalTriggerState, WritableLike } from './lib/types.js'
+import { BACKFILL_STATE_SCHEMA_VERSION } from './lib/types.js'
 import { spawn } from 'node:child_process'
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -973,26 +974,33 @@ function syncLocalTriggerLockPath(home: string): string {
 
 async function readBackfillIncrementalState(home: string, ctx?: RunContext): Promise<BackfillIncrementalState> {
   // Corrupt JSON now surfaces from readJsonIfExists; a missing file
-  // resolves to null. Anything else (wrong shape, future schema
+  // resolves to null. Anything else (wrong shape, mismatched schema
   // version, manual edits that dropped `sources`) lands here and would
   // previously vanish silently — log via debug so the user can see
   // when watermarks were dropped.
+  //
+  // When the on-disk schema version doesn't match the CLI's current
+  // BACKFILL_STATE_SCHEMA_VERSION we deliberately drop every watermark.
+  // The next sync-local-runner then re-parses every jsonl from scratch
+  // and the server upserts via `replace: true`, so a CLI upgrade that
+  // changed parser semantics (e.g. v2's dedup fix) silently rewrites
+  // historical rollups without the user knowing.
   const statePath = backfillIncrementalStatePath(home)
   const state = await readJsonIfExists(statePath)
   if (state === null) {
-    return { version: 1, sources: {} }
+    return { version: BACKFILL_STATE_SCHEMA_VERSION, sources: {} }
   }
   if (!isPlainObject(state) || !isPlainObject(state.sources)) {
     if (ctx) {
       debug(ctx, `backfill-state malformed at ${statePath}; ignoring watermarks\n`)
     }
-    return { version: 1, sources: {} }
+    return { version: BACKFILL_STATE_SCHEMA_VERSION, sources: {} }
   }
-  if (state.version !== undefined && state.version !== 1) {
+  if (state.version !== BACKFILL_STATE_SCHEMA_VERSION) {
     if (ctx) {
-      debug(ctx, `backfill-state version ${String(state.version)} at ${statePath} is not supported; ignoring watermarks\n`)
+      debug(ctx, `backfill-state version ${String(state.version)} at ${statePath} differs from current v${BACKFILL_STATE_SCHEMA_VERSION}; dropping watermarks so the next sync re-imports under the new parser\n`)
     }
-    return { version: 1, sources: {} }
+    return { version: BACKFILL_STATE_SCHEMA_VERSION, sources: {} }
   }
 
   const sources: BackfillIncrementalState['sources'] = {}
@@ -1003,7 +1011,7 @@ async function readBackfillIncrementalState(home: string, ctx?: RunContext): Pro
     }
   }
 
-  return { version: 1, sources }
+  return { version: BACKFILL_STATE_SCHEMA_VERSION, sources }
 }
 
 async function updateBackfillIncrementalState(
