@@ -1,3 +1,40 @@
+## v0.3.1
+
+[v0.3.0...v0.3.1](https://github.com/codetime-dev/codetime-cli/compare/v0.3.0...v0.3.1)
+
+### :sparkles: Features
+
+- **cli**: add amp backfill support and codex tier rewrite - By [Jianqi Pan](mailto:jannchie@gmail.com) in [2d4d465](https://github.com/codetime-dev/codetime-cli/commit/2d4d465)
+
+### :adhesive_bandage: Fixes
+
+- **ci**: avoid npm self-overwrite during publish workflow upgrade - By [Jianqi Pan](mailto:jannchie@gmail.com) in [cc12e58](https://github.com/codetime-dev/codetime-cli/commit/cc12e58)
+
+### :wrench: Chores
+
+- **cli**: add file logging for background errors - By [Jianqi Pan](mailto:jannchie@gmail.com) in [54bdcf1](https://github.com/codetime-dev/codetime-cli/commit/54bdcf1)
+- **release**: switch release tags to v prefix - By [Jianqi Pan](mailto:jannchie@gmail.com) in [674ccf5](https://github.com/codetime-dev/codetime-cli/commit/674ccf5)
+
+## v0.3.0
+
+[v0.2.1...v0.3.0](https://github.com/codetime-dev/codetime-cli/compare/v0.2.1...v0.3.0)
+
+### :sparkles: Features
+
+- **cli**: honor agent config env overrides - By [Jianqi Pan](mailto:jannchie@gmail.com) in [d28b8ec](https://github.com/codetime-dev/codetime-cli/commit/d28b8ec)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: dedup claude usage and reset backfill state schema - By [Jianqi Pan](mailto:jannchie@gmail.com) in [b8f5cc1](https://github.com/codetime-dev/codetime-cli/commit/b8f5cc1)
+
+### :memo: Documentation
+
+- update readme and publish workflow input - By [Jianqi Pan](mailto:jannchie@gmail.com) in [0292912](https://github.com/codetime-dev/codetime-cli/commit/0292912)
+
+### :wrench: Chores
+
+- **ci**: checkout latest release tag on manual dispatch - By [Jianqi Pan](mailto:jannchie@gmail.com) in [e80a117](https://github.com/codetime-dev/codetime-cli/commit/e80a117)
+
 ## v0.2.1
 
 [v0.3.0...v0.2.1](https://github.com/codetime-dev/codetime-cli/compare/v0.3.0...v0.2.1)
