@@ -47,9 +47,13 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           cache: pnpm
 
-      # npm >= 11.5.1 is required for trusted publishing (OIDC)
+      # npm >= 11.5.1 is required for trusted publishing (OIDC).
+      # Install into a separate prefix first to avoid the self-overwrite
+      # MODULE_NOT_FOUND bug seen when npm rewrites its own files in place.
       - name: Upgrade npm
-        run: npm install -g npm@latest
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm-upgrade" npm@latest
+          echo "$RUNNER_TEMP/npm-upgrade/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
