@@ -6,7 +6,6 @@ export const AGENT_TIME_SCHEMA_VERSION = '2026-04-29'
 export const KNOWN_AGENT_SOURCES = [
   'codex',
   'claude-code',
-  'cursor',
   'opencode',
   'pi',
   'amp',
@@ -68,22 +67,6 @@ export const SOURCE_CAPABILITIES: Record<KnownAgentSource, SourceCapabilities> =
     fileDiffStats: 'partial',
     permissionEvents: 'exact',
     transcriptLocator: 'exact',
-  },
-  'cursor': {
-    sessionLifecycle: 'derived',
-    turnLifecycle: 'derived',
-    agentHierarchy: 'none',
-    promptEvents: 'derived',
-    modelName: 'partial',
-    tokenUsage: 'none',
-    toolCalls: 'partial',
-    toolTiming: 'estimated',
-    commandTiming: 'partial',
-    fileReads: 'derived',
-    fileWrites: 'exact',
-    fileDiffStats: 'derived',
-    permissionEvents: 'none',
-    transcriptLocator: 'none',
   },
   'opencode': {
     sessionLifecycle: 'partial',
@@ -309,7 +292,7 @@ export interface StoredCanonicalEvent extends CanonicalEvent {
   receivedAt: string
 }
 
-export type BackfillSourceId = 'codex' | 'claude-code' | 'cursor' | 'opencode' | 'pi' | 'amp'
+export type BackfillSourceId = 'codex' | 'claude-code' | 'opencode' | 'pi' | 'amp'
 export type ImportRunStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ImportRunRecord {

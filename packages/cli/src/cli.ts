@@ -423,9 +423,9 @@ async function backfillCommand(options: ParsedArgs, ctx: RunContext, registry?: 
 
   if (action === 'import' && !options['dry-run']) {
     const requested = normalizeBackfillSource(stringOption(options.source) || 'all')
-    const supported = new Set<string>(['all', 'codex', 'claude-code', 'opencode', 'pi'])
+    const supported = new Set<string>(['all', 'codex', 'claude-code', 'opencode', 'pi', 'amp'])
     if (!supported.has(requested)) {
-      write(ctx.stderr, 'Only Codex, Claude Code, OpenCode, and Pi backfill import are implemented.\n')
+      write(ctx.stderr, `Unsupported backfill source: ${requested}\n`)
       return 1
     }
     const plan = await createBackfillPlanFromOptions(options, ctx, 'discover', reg)
@@ -693,10 +693,10 @@ async function importBackfillPlan(
   registry: AdapterRegistry,
 ): Promise<number> {
   const source = normalizeBackfillSource(stringOption(options.source) || 'all')
-  const supportedSources = new Set<BackfillSourceId>(['codex', 'claude-code', 'opencode', 'pi'])
+  const supportedSources = new Set<BackfillSourceId>(['codex', 'claude-code', 'opencode', 'pi', 'amp'])
   const home = resolveHome(options, ctx)
   if (source !== 'all' && !supportedSources.has(source as BackfillSourceId)) {
-    write(ctx.stderr, 'Only Codex, Claude Code, OpenCode, and Pi backfill import are implemented.\n')
+    write(ctx.stderr, `Unsupported backfill source: ${source}\n`)
     return 1
   }
 

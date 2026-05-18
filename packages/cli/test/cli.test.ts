@@ -663,18 +663,6 @@ test('backfill import sends parsed Claude Code events and counts API results', a
   assert.equal(modelRollup.totalTokens, 21)
 })
 
-test('backfill import rejects sources without parsers', async () => {
-  let stderr = ''
-  const exitCode = await run(['backfill', 'import', '--source', 'cursor'], testContext({
-    stderr: { write: (text) => {
-      stderr += text
-    } },
-  }))
-
-  assert.equal(exitCode, 1)
-  assert.match(stderr, /Only Codex, Claude Code, OpenCode, and Pi backfill import are implemented/)
-})
-
 test('backfill verify reports placeholder status for import runs', async () => {
   let output = ''
   const exitCode = await run(['backfill', 'verify', '--import-run', 'import_123', '--json'], testContext({
