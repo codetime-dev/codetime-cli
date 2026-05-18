@@ -1,3 +1,23 @@
+## v0.3.0
+
+[v0.2.1...v0.3.0](https://github.com/codetime-dev/codetime-cli/compare/v0.2.1...v0.3.0)
+
+### :sparkles: Features
+
+- **cli**: honor agent config env overrides - By [Jianqi Pan](mailto:jannchie@gmail.com) in [d28b8ec](https://github.com/codetime-dev/codetime-cli/commit/d28b8ec)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: dedup claude usage and reset backfill state schema - By [Jianqi Pan](mailto:jannchie@gmail.com) in [b8f5cc1](https://github.com/codetime-dev/codetime-cli/commit/b8f5cc1)
+
+### :memo: Documentation
+
+- update readme and publish workflow input - By [Jianqi Pan](mailto:jannchie@gmail.com) in [0292912](https://github.com/codetime-dev/codetime-cli/commit/0292912)
+
+### :wrench: Chores
+
+- **ci**: checkout latest release tag on manual dispatch - By [Jianqi Pan](mailto:jannchie@gmail.com) in [e80a117](https://github.com/codetime-dev/codetime-cli/commit/e80a117)
+
 ## v0.2.1
 
 [v0.2.0...v0.2.1](https://github.com/codetime-dev/codetime-cli/compare/v0.2.0...v0.2.1)
