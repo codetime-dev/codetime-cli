@@ -7,7 +7,6 @@ import type {
 } from '@codetime/shared'
 import type { BackfillSourceDefinition } from './lib/backfill.js'
 import type { BackfillImportCounts, BackfillIncrementalState, BackfillSourceFile, ParsedArgs, RunContext, SyncLocalLock, SyncLocalTriggerState, WritableLike } from './lib/types.js'
-import { BACKFILL_STATE_SCHEMA_VERSION } from './lib/types.js'
 import { spawn } from 'node:child_process'
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -34,6 +33,7 @@ import { defaultMachineName, ensureLocalMachineId, readConfig, writeConfig } fro
 import { DEFAULT_API_URL, DEFAULT_BACKFILL_BATCH_BYTES, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS, PACKAGE_VERSION } from './lib/constants.js'
 import { isPlainObject, numberOption, stringOption, valuesOption } from './lib/fields.js'
 import { countDirectoryEntries, listJsonlFiles, pathExists, readJsonIfExists } from './lib/fs.js'
+import { logError } from './lib/logger.js'
 import { ProgressBar } from './lib/progress.js'
 import {
   deleteMachine,
@@ -43,6 +43,7 @@ import {
   renameMachine,
   resolveRemote,
 } from './lib/remote.js'
+import { BACKFILL_STATE_SCHEMA_VERSION } from './lib/types.js'
 
 // ── Registry ──
 
@@ -98,6 +99,7 @@ export async function run(argv: string[], context: Partial<RunContext> = {}): Pr
   }
   catch (error) {
     write(ctx.stderr, `${(error as Error).message}\n`)
+    await logError('cli', error, { argv })
     return 1
   }
 }
@@ -288,22 +290,33 @@ async function installCommand(options: ParsedArgs, ctx: RunContext, registry: Ad
 }
 
 async function hookCommand(options: ParsedArgs, ctx: RunContext): Promise<number> {
-  const agent = requiredOption(options, 'agent')
-  const payload = await readHookPayload(ctx.stdin)
-  const enrichment = await enrichFromTranscript(payload, claudeUsageFromMessage)
-  const events = hookEventsFromPayload(agent, payload, options, enrichment, { tokenUsageFromPayload })
-  assertValidEvents(events)
+  const home = resolveHome(options, ctx)
+  try {
+    const agent = requiredOption(options, 'agent')
+    const payload = await readHookPayload(ctx.stdin)
+    const enrichment = await enrichFromTranscript(payload, claudeUsageFromMessage)
+    const events = hookEventsFromPayload(agent, payload, options, enrichment, { tokenUsageFromPayload })
+    assertValidEvents(events)
 
-  if (options['dry-run']) {
-    write(ctx.stdout, `${JSON.stringify(events.length === 1 ? events[0] : events, null, 2)}\n`)
+    if (options['dry-run']) {
+      write(ctx.stdout, `${JSON.stringify(events.length === 1 ? events[0] : events, null, 2)}\n`)
+      return 0
+    }
+
+    return await syncLocalTriggerCommand({
+      ...options,
+      agent,
+      'min-interval': stringOption(options['min-interval']) || String(DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS),
+    }, ctx)
+  }
+  catch (error) {
+    // Hooks run inside the user's agent (Claude Code, Codex, etc).
+    // Bubbling an error there spams the user with stderr; persist to the
+    // log file and exit 0 so the agent isn't disturbed.
+    await logError('hook', error, { agent: stringOption(options.agent) }, home)
+    debug(ctx, `[codetime] hook failed: ${(error as Error).message}\n`)
     return 0
   }
-
-  return syncLocalTriggerCommand({
-    ...options,
-    agent,
-    'min-interval': stringOption(options['min-interval']) || String(DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS),
-  }, ctx)
 }
 
 async function syncLocalTriggerCommand(options: ParsedArgs, ctx: RunContext, _registry?: AdapterRegistry): Promise<number> {
@@ -368,6 +381,12 @@ async function syncLocalRunnerCommand(options: ParsedArgs, ctx: RunContext, _reg
       source: 'all',
     }, ctx)
     return exitCode
+  }
+  catch (error) {
+    // The runner is spawned detached with stdio: 'ignore', so the stack
+    // trace would be lost otherwise. Persist it so users can diagnose.
+    await logError('sync-local-runner', error, { home }, home)
+    throw error
   }
   finally {
     const nextState = await readSyncLocalTriggerState(statePath)
@@ -506,22 +525,39 @@ async function createBackfillEventsFromDefs(
   overrideFiles?: string[],
 ): Promise<CanonicalEvent[]> {
   const events: CanonicalEvent[] = []
+  const home = resolveHome(options, ctx)
 
+  // Same isolation policy as the import path: one source blowing up
+  // (e.g. older opencode SQLite schemas) must not poison the whole plan.
   for (const item of sourceDefs) {
     const parser = registry.getParser(item.id)
     if (!parser) {
       continue
     }
 
-    const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
-    const files = overrideFiles ?? sourceFiles.map(f => f.path)
+    let files: string[]
+    try {
+      const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
+      files = overrideFiles ?? sourceFiles.map(f => f.path)
+    }
+    catch (error) {
+      await logError('backfill.listFiles', error, { source: item.id, phase: 'plan' }, home)
+      debug(ctx, `[codetime] skip ${item.id} in plan: list files failed: ${(error as Error).message}\n`)
+      continue
+    }
 
     for (const filePath of files) {
-      const parsed = await parser(filePath, options)
-      for (const event of parsed) {
-        if (matchesBackfillFilters(event, options)) {
-          events.push(event)
+      try {
+        const parsed = await parser(filePath, options)
+        for (const event of parsed) {
+          if (matchesBackfillFilters(event, options)) {
+            events.push(event)
+          }
         }
+      }
+      catch (error) {
+        await logError('backfill.parse', error, { source: item.id, file: filePath, phase: 'plan' }, home)
+        debug(ctx, `[codetime] skip ${item.id} file ${filePath} in plan: ${(error as Error).message}\n`)
       }
     }
   }
@@ -747,30 +783,59 @@ async function collectCanonicalEvents(
 }> {
   const selectedFilesBySource = new Map<BackfillSourceId, BackfillSourceFile[]>()
   const canonicalEvents: CanonicalEvent[] = []
+  const home = resolveHome(options, ctx)
 
   for (const item of sourceDefs) {
     const parser = registry.getParser(item.id)
     if (!parser) {
       continue
     }
-    const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
-    const selectedFiles = selectBackfillFilesForImport(sourceFiles, incrementalState?.sources[item.id]?.watermarkTs)
+    // Per-source isolation: a broken parser or missing history dir for
+    // one source (e.g. opencode's older schemas) must not abort the
+    // whole run. Failures land in ~/.codetime/logs/cli.log; the
+    // watermark stays unadvanced because selectedFilesBySource only
+    // gets populated on success.
+    let selectedFiles: BackfillSourceFile[]
+    try {
+      const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
+      selectedFiles = selectBackfillFilesForImport(sourceFiles, incrementalState?.sources[item.id]?.watermarkTs)
+    }
+    catch (error) {
+      await logError('backfill.listFiles', error, { source: item.id }, home)
+      debug(ctx, `[codetime] skip ${item.id}: list files failed: ${(error as Error).message}\n`)
+      continue
+    }
     selectedFilesBySource.set(item.id, selectedFiles)
     const filePaths = selectedFiles.map(f => f.path)
     const sourceEvents: CanonicalEvent[] = []
+    let sourceFailed = false
 
     const bar = options.json ? undefined : new ProgressBar(ctx.stdout, `${item.id.padEnd(12)}`)
     bar?.init(filePaths.length, `0 events`)
     for (let fi = 0; fi < filePaths.length; fi += 1) {
-      const parsed = await parser(filePaths[fi], options)
-      for (const event of parsed) {
-        if (matchesBackfillFilters(event, options)) {
-          sourceEvents.push(event)
+      try {
+        const parsed = await parser(filePaths[fi], options)
+        for (const event of parsed) {
+          if (matchesBackfillFilters(event, options)) {
+            sourceEvents.push(event)
+          }
         }
+      }
+      catch (error) {
+        sourceFailed = true
+        await logError('backfill.parse', error, { source: item.id, file: filePaths[fi] }, home)
+        debug(ctx, `[codetime] skip ${item.id} file ${filePaths[fi]}: ${(error as Error).message}\n`)
       }
       bar?.tick(`${fi + 1}/${filePaths.length} files, ${sourceEvents.length} events`)
     }
-    bar?.finalize(`${sourceEvents.length} events`)
+    bar?.finalize(`${sourceEvents.length} events${sourceFailed ? ' (partial — see logs)' : ''}`)
+
+    // If any file failed to parse, drop this source from the watermark
+    // update set so we retry on the next run instead of marking it as
+    // fully imported.
+    if (sourceFailed) {
+      selectedFilesBySource.delete(item.id)
+    }
 
     for (const event of sourceEvents) canonicalEvents.push(event)
   }

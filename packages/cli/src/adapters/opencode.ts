@@ -42,15 +42,35 @@ async function parseOpenCodeSessionFile(
   const events: CanonicalEvent[] = []
 
   try {
+    // Older OpenCode databases predate the `path` column on session.
+    // Probe schema first and only select columns that exist.
+    const sessionCols = new Set(
+      (db.prepare('PRAGMA table_info(session)').all() as Array<{ name: string }>)
+        .map(row => row.name),
+    )
+    const hasDirectory = sessionCols.has('directory')
+    const hasPath = sessionCols.has('path')
+    const hasArchived = sessionCols.has('time_archived')
+    const selectCols = ['id', 'title', 'time_created']
+    if (hasDirectory) {
+      selectCols.push('directory')
+    }
+    if (hasPath) {
+      selectCols.push('path')
+    }
+    if (hasArchived) {
+      selectCols.push('time_archived')
+    }
+
     const sessions = db.prepare(
-      'SELECT id, directory, path, title, time_created, time_archived FROM session WHERE time_created IS NOT NULL ORDER BY time_created',
+      `SELECT ${selectCols.join(', ')} FROM session WHERE time_created IS NOT NULL ORDER BY time_created`,
     ).all() as Array<{
       id: string
-      directory: string | null
-      path: string | null
+      directory?: string | null
+      path?: string | null
       title: string
       time_created: number
-      time_archived: number | null
+      time_archived?: number | null
     }>
 
     for (const session of sessions) {

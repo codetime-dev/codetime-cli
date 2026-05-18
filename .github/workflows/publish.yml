@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       dist_tag:
-        description: 'npm dist-tag channel (latest / beta / next). Git tag is auto-selected.'
+        description: npm dist-tag channel (latest / beta / next). Git tag is auto-selected.
         required: false
         default: latest
 
