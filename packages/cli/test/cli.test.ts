@@ -1275,3 +1275,153 @@ function testContext(overrides = {}) {
     ...overrides,
   }
 }
+
+// ── Config override env vars ──
+//
+// Each agent supports relocating its config/data directory. The CLI must honor
+// the same env vars users set on the agent itself, otherwise codetime stops
+// seeing sessions the moment someone moves their config dir.
+
+async function detectTargets(home: string, env: Record<string, string>): Promise<Record<string, { detectPath: string, installedPath: string, installed: boolean, detected: boolean }>> {
+  let output = ''
+  const exitCode = await run(['detect', '--json', '--home', home], testContext({
+    env: { HOME: home, ...env },
+    stdout: { write: (text: string) => {
+      output += text
+    } },
+  }))
+  assert.equal(exitCode, 0)
+  const parsed = JSON.parse(output) as { targets: Array<{ id: string, detectPath: string, installedPath: string, installed: boolean, detected: boolean }> }
+  return Object.fromEntries(parsed.targets.map(t => [t.id, t]))
+}
+
+test('CLAUDE_CONFIG_DIR relocates Claude Code detect, install, and source paths', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const claudeDir = await mkdtemp(path.join(tmpdir(), 'claude-config-'))
+
+  const targets = await detectTargets(home, { CLAUDE_CONFIG_DIR: claudeDir })
+  assert.equal(targets['claude-code'].detectPath, claudeDir)
+  assert.equal(targets['claude-code'].installedPath, path.join(claudeDir, 'settings.json'))
+
+  const exitCode = await run(['install', '--target', 'claude-code', '--home', home], testContext({
+    env: { HOME: home, CLAUDE_CONFIG_DIR: claudeDir },
+  }))
+  assert.equal(exitCode, 0)
+  const settings = JSON.parse(await readFile(path.join(claudeDir, 'settings.json'), 'utf8'))
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, 'codetime hook --agent claude')
+  await assert.rejects(readFile(path.join(home, '.claude', 'settings.json'), 'utf8'), { code: 'ENOENT' })
+})
+
+test('CODEX_HOME relocates Codex detect, install, and source paths', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+
+  const targets = await detectTargets(home, { CODEX_HOME: codexHome })
+  assert.equal(targets.codex.detectPath, codexHome)
+  assert.equal(targets.codex.installedPath, path.join(codexHome, 'hooks.json'))
+
+  const exitCode = await run(['install', '--target', 'codex', '--home', home], testContext({
+    env: { HOME: home, CODEX_HOME: codexHome },
+  }))
+  assert.equal(exitCode, 0)
+  const hooks = JSON.parse(await readFile(path.join(codexHome, 'hooks.json'), 'utf8'))
+  assert.equal(hooks.hooks.SessionStart[0].hooks[0].command, 'codetime hook --agent codex')
+  await assert.rejects(readFile(path.join(home, '.codex', 'hooks.json'), 'utf8'), { code: 'ENOENT' })
+})
+
+test('PI_CODING_AGENT_DIR relocates Pi detect and install paths', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const piDir = await mkdtemp(path.join(tmpdir(), 'pi-agent-'))
+
+  const targets = await detectTargets(home, { PI_CODING_AGENT_DIR: piDir })
+  assert.equal(targets.pi.detectPath, piDir)
+  assert.equal(targets.pi.installedPath, path.join(piDir, 'extensions', 'codetime.ts'))
+
+  const exitCode = await run(['install', '--target', 'pi', '--home', home], testContext({
+    env: { HOME: home, PI_CODING_AGENT_DIR: piDir },
+  }))
+  assert.equal(exitCode, 0)
+  const extension = await readFile(path.join(piDir, 'extensions', 'codetime.ts'), 'utf8')
+  assert.match(extension, /"codetime"/)
+  assert.match(extension, /"--agent", "pi"/)
+})
+
+test('PI_CODING_AGENT_SESSION_DIR relocates only the Pi sessions dir, not the install path', async () => {
+  // Plan a backfill against a relocated sessions dir while leaving the agent
+  // dir at its default — this proves PI_CODING_AGENT_SESSION_DIR is honored
+  // independently for backfill source discovery.
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const sessionsDir = await mkdtemp(path.join(tmpdir(), 'pi-sessions-'))
+  // Default install path should still resolve under ~/.pi/agent.
+  const targets = await detectTargets(home, { PI_CODING_AGENT_SESSION_DIR: sessionsDir })
+  assert.equal(targets.pi.detectPath, path.join(home, '.pi', 'agent'))
+
+  let output = ''
+  const exitCode = await run([
+    'backfill',
+    'discover',
+    '--source',
+    'pi',
+    '--home',
+    home,
+    '--json',
+    '--include-source-path',
+  ], testContext({
+    env: { HOME: home, PI_CODING_AGENT_SESSION_DIR: sessionsDir },
+    stdout: { write: (text: string) => {
+      output += text
+    } },
+  }))
+  assert.equal(exitCode, 0)
+  const plan = JSON.parse(output)
+  const piCandidate = plan.candidates.find((c: { source: string }) => c.source === 'pi')
+  assert.ok(piCandidate, 'expected a pi backfill candidate')
+  assert.equal(piCandidate.path, sessionsDir)
+})
+
+test('OPENCODE_CONFIG_DIR relocates OpenCode install path', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const opencodeDir = await mkdtemp(path.join(tmpdir(), 'opencode-config-'))
+
+  const targets = await detectTargets(home, { OPENCODE_CONFIG_DIR: opencodeDir })
+  assert.equal(targets.opencode.detectPath, opencodeDir)
+  assert.equal(targets.opencode.installedPath, path.join(opencodeDir, 'plugins', 'codetime.mjs'))
+
+  const exitCode = await run(['install', '--target', 'opencode', '--home', home], testContext({
+    env: { HOME: home, OPENCODE_CONFIG_DIR: opencodeDir },
+  }))
+  assert.equal(exitCode, 0)
+  const plugin = await readFile(path.join(opencodeDir, 'plugins', 'codetime.mjs'), 'utf8')
+  assert.match(plugin, /codetime hook --agent opencode/)
+})
+
+test('XDG_DATA_HOME relocates OpenCode backfill source candidates', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const xdgData = await mkdtemp(path.join(tmpdir(), 'xdg-data-'))
+
+  let output = ''
+  const exitCode = await run([
+    'backfill',
+    'plan',
+    '--source',
+    'opencode',
+    '--home',
+    home,
+    '--json',
+    '--include-source-path',
+  ], testContext({
+    env: { HOME: home, XDG_DATA_HOME: xdgData },
+    stdout: { write: (text: string) => {
+      output += text
+    } },
+  }))
+  assert.equal(exitCode, 0)
+  const plan = JSON.parse(output)
+  const candidatePaths = plan.candidates
+    .filter((c: { source: string }) => c.source === 'opencode')
+    .map((c: { path: string }) => c.path)
+  assert.ok(
+    candidatePaths.includes(path.join(xdgData, 'opencode', 'opencode.db')),
+    `expected XDG_DATA_HOME path among ${JSON.stringify(candidatePaths)}`,
+  )
+})

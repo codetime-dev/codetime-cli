@@ -214,18 +214,19 @@ function normalizeOptions(options: Record<string, unknown>): ParsedArgs {
 
 async function detectCommand(options: ParsedArgs, ctx: RunContext, registry: AdapterRegistry) {
   const home = resolveHome(options, ctx)
+  const env = ctx.env
   const adapters = registry.all()
   const targets = await Promise.all(adapters.map(async (adapter) => {
-    const detected = await pathExists(adapter.detectPath(home))
-    const installed = await adapter.isInstalled(home)
+    const detected = await pathExists(adapter.detectPath(home, env))
+    const installed = await adapter.isInstalled(home, env)
     return {
       id: adapter.id,
       label: adapter.label,
       kind: adapter.kind,
       detected,
       installed,
-      detectPath: adapter.detectPath(home),
-      installedPath: adapter.installedPath(home),
+      detectPath: adapter.detectPath(home, env),
+      installedPath: adapter.installedPath(home, env),
     }
   }))
 
@@ -243,6 +244,7 @@ async function detectCommand(options: ParsedArgs, ctx: RunContext, registry: Ada
 
 async function installCommand(options: ParsedArgs, ctx: RunContext, registry: AdapterRegistry): Promise<number> {
   const home = resolveHome(options, ctx)
+  const env = ctx.env
   const dryRun = Boolean(options['dry-run'])
   const force = Boolean(options.force)
   const allAdapters = registry.all()
@@ -255,7 +257,7 @@ async function installCommand(options: ParsedArgs, ctx: RunContext, registry: Ad
 
   const detected: string[] = []
   for (const adapter of allAdapters) {
-    if (await pathExists(adapter.detectPath(home))) {
+    if (await pathExists(adapter.detectPath(home, env))) {
       detected.push(adapter.id)
     }
   }
@@ -272,7 +274,7 @@ async function installCommand(options: ParsedArgs, ctx: RunContext, registry: Ad
   }
 
   for (const adapter of allAdapters.filter(a => selectedIds.includes(a.id))) {
-    for (const entry of adapter.installEntries(home)) {
+    for (const entry of adapter.installEntries(home, env)) {
       await installEntry(entry, {
         dryRun,
         force,
@@ -423,15 +425,16 @@ async function createBackfillPlanFromOptions(
   registry: AdapterRegistry,
 ): Promise<BackfillPlan> {
   const home = resolveHome(options, ctx)
+  const env = ctx.env
   const source = normalizeBackfillSource(stringOption(options.source) || 'all')
   const sourceDefs = source === 'all'
-    ? registry.all().map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home) }))
+    ? registry.all().map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home, env) }))
     : (() => {
         const adapter = registry.get(source)
         if (!adapter) {
           return []
         }
-        return [{ id: adapter.id, label: adapter.label, paths: adapter.sourcePaths(home) }]
+        return [{ id: adapter.id, label: adapter.label, paths: adapter.sourcePaths(home, env) }]
       })()
 
   if (sourceDefs.length === 0) {
@@ -442,7 +445,7 @@ async function createBackfillPlanFromOptions(
   const candidates = candidateList.flat()
   let events: CanonicalEvent[] = []
   if (action !== 'discover') {
-    const eventList = await createBackfillEventsFromDefs(sourceDefs, options, registry)
+    const eventList = await createBackfillEventsFromDefs(sourceDefs, options, registry, ctx)
     events = eventList.flat()
   }
   const plannedEvents = events.map(event => ({
@@ -498,6 +501,7 @@ async function createBackfillEventsFromDefs(
   sourceDefs: BackfillSourceDefinition[],
   options: ParsedArgs,
   registry: AdapterRegistry,
+  ctx: RunContext,
   overrideFiles?: string[],
 ): Promise<CanonicalEvent[]> {
   const events: CanonicalEvent[] = []
@@ -508,7 +512,7 @@ async function createBackfillEventsFromDefs(
       continue
     }
 
-    const sourceFiles = await listBackfillSourceFiles(item, options)
+    const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
     const files = overrideFiles ?? sourceFiles.map(f => f.path)
 
     for (const filePath of files) {
@@ -547,9 +551,10 @@ async function createBackfillCandidates(
 async function listBackfillSourceFiles(
   source: BackfillSourceDefinition,
   options: ParsedArgs,
+  ctx: RunContext,
 ): Promise<BackfillSourceFile[]> {
   if (source.id === 'opencode') {
-    return opencodeBackfillFiles(stringOption(options['source-root']))
+    return opencodeBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
   }
 
   const roots = stringOption(options['source-root'])
@@ -648,7 +653,7 @@ async function importBackfillPlan(
 
   const sourceDefs = registry.all()
     .filter(a => supportedSources.has(a.id) && (source === 'all' || a.id === source))
-    .map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home) }))
+    .map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home, ctx.env) }))
 
   if (options.force) {
     await purgeForcedSources(sourceDefs, home, options, ctx)
@@ -747,7 +752,7 @@ async function collectCanonicalEvents(
     if (!parser) {
       continue
     }
-    const sourceFiles = await listBackfillSourceFiles(item, options)
+    const sourceFiles = await listBackfillSourceFiles(item, options, ctx)
     const selectedFiles = selectBackfillFilesForImport(sourceFiles, incrementalState?.sources[item.id]?.watermarkTs)
     selectedFilesBySource.set(item.id, selectedFiles)
     const filePaths = selectedFiles.map(f => f.path)

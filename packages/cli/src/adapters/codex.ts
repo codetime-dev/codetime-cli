@@ -1,5 +1,5 @@
 import type { CanonicalEvent } from '@codetime/shared'
-import type { AgentAdapter, InstallEntry } from './types.js'
+import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
@@ -514,41 +514,50 @@ function hookConfig(): object {
 
 // ── Adapter factory ──
 
-export function createCodexAdapter(): AgentAdapter {
-  const CODE_PATH = '.codex'
+// Codex relocates its entire data dir via CODEX_HOME (config.toml, auth.json,
+// sessions/, history.jsonl). Honor it for both install and backfill paths.
+function codexHome(home: string, env?: AdapterEnv): string {
+  const override = env?.CODEX_HOME
+  if (override && override.trim()) {
+    return path.resolve(override)
+  }
+  return path.join(home, '.codex')
+}
 
+export function createCodexAdapter(): AgentAdapter {
   return {
     id: 'codex',
     label: 'Codex',
     agentName: 'codex',
     kind: 'agent',
 
-    detectPath(home: string) {
-      return path.join(home, CODE_PATH)
+    detectPath(home: string, env?: AdapterEnv) {
+      return codexHome(home, env)
     },
-    installedPath(home: string) {
-      return path.join(home, CODE_PATH, 'hooks.json')
+    installedPath(home: string, env?: AdapterEnv) {
+      return path.join(codexHome(home, env), 'hooks.json')
     },
 
-    async isInstalled(home: string) {
+    async isInstalled(home: string, env?: AdapterEnv) {
       return isHooksJsonInstalled(
-        path.join(home, CODE_PATH, 'hooks.json'),
+        path.join(codexHome(home, env), 'hooks.json'),
         'codetime hook --agent codex',
       )
     },
 
-    installEntries(home: string): InstallEntry[] {
+    installEntries(home: string, env?: AdapterEnv): InstallEntry[] {
       return [{
         kind: 'hooks-json',
-        path: path.join(home, CODE_PATH, 'hooks.json'),
+        path: path.join(codexHome(home, env), 'hooks.json'),
         content: hookConfig(),
       }]
     },
 
-    sourcePaths(home: string): string[] {
+    sourcePaths(home: string, env?: AdapterEnv): string[] {
+      const base = codexHome(home, env)
       return [
-        path.join(home, '.codex', 'sessions'),
-        path.join(home, '.codex', 'history.jsonl'),
+        path.join(base, 'sessions'),
+        path.join(base, 'history.jsonl'),
       ]
     },
 

@@ -1,5 +1,5 @@
 import type { CanonicalEvent, MetricBag } from '@codetime/shared'
-import type { AgentAdapter, InstallEntry } from './types.js'
+import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -422,10 +422,40 @@ function opencodeUsageFromInfo(info: Record<string, unknown>): OpenCodeUsage | u
   }
 }
 
+// ── Path resolution ──
+
+// OpenCode follows XDG for its config (~/.config/opencode) and data
+// (~/.local/share/opencode), but also reads OPENCODE_CONFIG_DIR for the former.
+// Both can move independently — agents, plugins, and history.
+
+function opencodeConfigDir(home: string, env?: AdapterEnv): string {
+  const override = env?.OPENCODE_CONFIG_DIR
+  if (override && override.trim()) {
+    return path.resolve(override)
+  }
+  const xdgConfig = env?.XDG_CONFIG_HOME
+  if (xdgConfig && xdgConfig.trim()) {
+    return path.join(path.resolve(xdgConfig), 'opencode')
+  }
+  return path.join(home, '.config', 'opencode')
+}
+
+function opencodeDataCandidates(home: string, env?: AdapterEnv): string[] {
+  const xdgData = env?.XDG_DATA_HOME
+  const primary = xdgData && xdgData.trim()
+    ? path.join(path.resolve(xdgData), 'opencode', 'opencode.db')
+    : path.join(home, '.local', 'share', 'opencode', 'opencode.db')
+  // Keep the legacy ~/.opencode/opencode.db location as a fallback for older
+  // installs that haven't migrated to the XDG data dir.
+  return [primary, path.join(home, '.opencode', 'opencode.db')]
+}
+
 // ── Backfill file discovery (special: OpenCode uses SQLite, not JSONL) ──
 
 export async function opencodeBackfillFiles(
   sourceRoot?: string,
+  home: string = os.homedir(),
+  env?: AdapterEnv,
 ): Promise<Array<{ path: string, modifiedAt: string }>> {
   const { stat } = await import('node:fs/promises')
   if (sourceRoot) {
@@ -439,11 +469,7 @@ export async function opencodeBackfillFiles(
     return [{ path: sourceRoot, modifiedAt: info.mtime.toISOString() }]
   }
 
-  const candidates = [
-    path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db'),
-    path.join(os.homedir(), '.opencode', 'opencode.db'),
-  ]
-  for (const candidatePath of candidates) {
+  for (const candidatePath of opencodeDataCandidates(home, env)) {
     const info = await stat(candidatePath).catch(() => null)
     if (info) {
       return [{ path: candidatePath, modifiedAt: info.mtime.toISOString() }]
@@ -503,7 +529,6 @@ export const AgentTime = async ({ $, directory }) => {
 // ── Adapter factory ──
 
 export function createOpenCodeAdapter(): AgentAdapter {
-  const OPENCODE_CONFIG = '.config/opencode'
   const PLUGIN_PATH = 'plugins/codetime.mjs'
 
   return {
@@ -512,17 +537,17 @@ export function createOpenCodeAdapter(): AgentAdapter {
     agentName: 'opencode',
     kind: 'agent',
 
-    detectPath(home: string) {
-      return path.join(home, OPENCODE_CONFIG)
+    detectPath(home: string, env?: AdapterEnv) {
+      return opencodeConfigDir(home, env)
     },
-    installedPath(home: string) {
-      return path.join(home, OPENCODE_CONFIG, PLUGIN_PATH)
+    installedPath(home: string, env?: AdapterEnv) {
+      return path.join(opencodeConfigDir(home, env), PLUGIN_PATH)
     },
 
-    async isInstalled(home: string) {
+    async isInstalled(home: string, env?: AdapterEnv) {
       try {
         const { pathExists } = await import('../lib/fs.js')
-        return await pathExists(path.join(home, OPENCODE_CONFIG, PLUGIN_PATH))
+        return await pathExists(path.join(opencodeConfigDir(home, env), PLUGIN_PATH))
           || await pathExists(path.join('.opencode', PLUGIN_PATH))
       }
       catch {
@@ -530,19 +555,16 @@ export function createOpenCodeAdapter(): AgentAdapter {
       }
     },
 
-    installEntries(home: string): InstallEntry[] {
+    installEntries(home: string, env?: AdapterEnv): InstallEntry[] {
       return [{
         kind: 'file',
-        path: path.join(home, OPENCODE_CONFIG, PLUGIN_PATH),
+        path: path.join(opencodeConfigDir(home, env), PLUGIN_PATH),
         content: opencodePluginContent(),
       }]
     },
 
-    sourcePaths(home: string): string[] {
-      return [
-        path.join(home, '.local', 'share', 'opencode', 'opencode.db'),
-        path.join(home, '.opencode', 'opencode.db'),
-      ]
+    sourcePaths(home: string, env?: AdapterEnv): string[] {
+      return opencodeDataCandidates(home, env)
     },
 
     parseSessionFile: parseOpenCodeSessionFile,

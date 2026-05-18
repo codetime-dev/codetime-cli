@@ -1,5 +1,5 @@
 import type { CanonicalEvent, FileActivityRecord, MetricBag } from '@codetime/shared'
-import type { AgentAdapter, InstallEntry } from './types.js'
+import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import {
@@ -528,42 +528,59 @@ export default function (pi: ExtensionAPI) {
 
 // ── Adapter factory ──
 
-export function createPiAdapter(): AgentAdapter {
-  const PI_EXTENSIONS_DIR = '.pi/agent/extensions'
+// Pi exposes two independent overrides: PI_CODING_AGENT_DIR moves the whole
+// agent dir (extensions, config), while PI_CODING_AGENT_SESSION_DIR can shift
+// just the sessions folder. Resolve them separately so codetime can find each.
+function piAgentDir(home: string, env?: AdapterEnv): string {
+  const override = env?.PI_CODING_AGENT_DIR
+  if (override && override.trim()) {
+    return path.resolve(override)
+  }
+  return path.join(home, '.pi', 'agent')
+}
 
+function piSessionDir(home: string, env?: AdapterEnv): string {
+  const override = env?.PI_CODING_AGENT_SESSION_DIR
+  if (override && override.trim()) {
+    return path.resolve(override)
+  }
+  return path.join(piAgentDir(home, env), 'sessions')
+}
+
+export function createPiAdapter(): AgentAdapter {
   return {
     id: 'pi',
     label: 'Pi',
     agentName: 'pi',
     kind: 'agent',
 
-    detectPath(home: string) {
-      return path.join(home, '.pi', 'agent')
+    detectPath(home: string, env?: AdapterEnv) {
+      return piAgentDir(home, env)
     },
-    installedPath(home: string) {
-      return path.join(home, PI_EXTENSIONS_DIR, 'codetime.ts')
+    installedPath(home: string, env?: AdapterEnv) {
+      return path.join(piAgentDir(home, env), 'extensions', 'codetime.ts')
     },
 
-    async isInstalled(home: string) {
+    async isInstalled(home: string, env?: AdapterEnv) {
       try {
         const { pathExists } = await import('../lib/fs.js')
-        return await pathExists(path.join(home, PI_EXTENSIONS_DIR, 'codetime.ts'))
+        return await pathExists(path.join(piAgentDir(home, env), 'extensions', 'codetime.ts'))
       }
       catch {
         return false
       }
     },
 
-    installEntries(home: string): InstallEntry[] {
+    installEntries(home: string, env?: AdapterEnv): InstallEntry[] {
       return [{
         kind: 'file',
-        path: path.join(home, PI_EXTENSIONS_DIR, 'codetime.ts'),
+        path: path.join(piAgentDir(home, env), 'extensions', 'codetime.ts'),
         content: piExtensionContent(),
       }]
     },
 
-    sourcePaths(home: string): string[] {
-      return [path.join(home, '.pi', 'agent', 'sessions')]
+    sourcePaths(home: string, env?: AdapterEnv): string[] {
+      return [piSessionDir(home, env)]
     },
 
     parseSessionFile: parsePiSessionFile,

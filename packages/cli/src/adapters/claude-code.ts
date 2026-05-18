@@ -1,5 +1,5 @@
 import type { CanonicalEvent, FileActivityRecord, MetricBag } from '@codetime/shared'
-import type { AgentAdapter, InstallEntry } from './types.js'
+import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
 import { readFile, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -613,40 +613,53 @@ function hookConfig(): object {
 
 // ── Adapter factory ──
 
-export function createClaudeCodeAdapter(): AgentAdapter {
-  const CLAUDE_PATH = '.claude'
+// Resolve the effective Claude config directory. Claude Code uses
+// CLAUDE_CONFIG_DIR to relocate the entire `.claude` tree (settings, projects,
+// sessions); honor it so codetime can find sessions in non-default locations.
+function claudeConfigDir(home: string, env?: AdapterEnv): string {
+  const override = env?.CLAUDE_CONFIG_DIR
+  if (override && override.trim()) {
+    return path.resolve(override)
+  }
+  return path.join(home, '.claude')
+}
 
+export function createClaudeCodeAdapter(): AgentAdapter {
   return {
     id: 'claude-code',
     label: 'Claude Code',
     agentName: 'claude',
     kind: 'agent',
 
-    detectPath(home: string) {
-      return path.join(home, CLAUDE_PATH)
+    detectPath(home: string, env?: AdapterEnv) {
+      return claudeConfigDir(home, env)
     },
-    installedPath(home: string) {
-      return path.join(home, CLAUDE_PATH, 'settings.json')
+    installedPath(home: string, env?: AdapterEnv) {
+      return path.join(claudeConfigDir(home, env), 'settings.json')
     },
 
-    async isInstalled(home: string) {
+    async isInstalled(home: string, env?: AdapterEnv) {
       return isHooksJsonInstalled(
-        path.join(home, CLAUDE_PATH, 'settings.json'),
+        path.join(claudeConfigDir(home, env), 'settings.json'),
         'codetime hook --agent claude',
       )
     },
 
-    installEntries(home: string): InstallEntry[] {
+    installEntries(home: string, env?: AdapterEnv): InstallEntry[] {
       return [{
         kind: 'hooks-json',
-        path: path.join(home, CLAUDE_PATH, 'settings.json'),
+        path: path.join(claudeConfigDir(home, env), 'settings.json'),
         content: hookConfig(),
       }]
     },
 
-    sourcePaths(home: string): string[] {
+    sourcePaths(home: string, env?: AdapterEnv): string[] {
+      const base = claudeConfigDir(home, env)
+      // .claude.json (project trust/state) historically lived alongside the
+      // home dir, but CLAUDE_CONFIG_DIR also relocates it.
       return [
-        path.join(home, '.claude', 'projects'),
+        path.join(base, 'projects'),
+        path.join(base, '.claude.json'),
         path.join(home, '.claude.json'),
       ]
     },

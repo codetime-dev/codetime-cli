@@ -7,6 +7,13 @@ export interface InstallEntry {
   content: string | object
 }
 
+/**
+ * Environment shape consumed by adapters when resolving paths. Adapters honor
+ * the env vars exposed by each upstream agent so codetime tracks sessions
+ * even when users relocate their config/data directories.
+ */
+export type AdapterEnv = Record<string, string | undefined>
+
 export interface AgentAdapter {
   /** Unique identifier matching BackfillSourceId */
   readonly id: BackfillSourceId
@@ -20,18 +27,18 @@ export interface AgentAdapter {
   // ── Detection & Installation ──
 
   /** Path whose existence indicates the agent is installed */
-  detectPath: (home: string) => string
+  detectPath: (home: string, env?: AdapterEnv) => string
   /** Path of the codetime integration file when installed */
-  installedPath: (home: string) => string
+  installedPath: (home: string, env?: AdapterEnv) => string
   /** Whether codetime integration is already installed */
-  isInstalled: (home: string) => Promise<boolean>
+  isInstalled: (home: string, env?: AdapterEnv) => Promise<boolean>
   /** Installation entries to write during `codetime install` */
-  installEntries: (home: string) => InstallEntry[]
+  installEntries: (home: string, env?: AdapterEnv) => InstallEntry[]
 
   // ── Backfill ──
 
   /** Directories/files containing historical session data */
-  sourcePaths: (home: string) => string[]
+  sourcePaths: (home: string, env?: AdapterEnv) => string[]
   /** Parse a single session file into canonical events, or null if unsupported */
   parseSessionFile?: (
     filePath: string,
