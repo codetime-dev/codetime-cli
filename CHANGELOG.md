@@ -1,3 +1,16 @@
+## v0.2.1
+
+[v0.3.0...v0.2.1](https://github.com/codetime-dev/codetime-cli/compare/v0.3.0...v0.2.1)
+
+### :adhesive_bandage: Fixes
+
+- **ci**: avoid npm self-overwrite during publish workflow upgrade - By [Jianqi Pan](mailto:jannchie@gmail.com) in [cc12e58](https://github.com/codetime-dev/codetime-cli/commit/cc12e58)
+
+### :wrench: Chores
+
+- **cli**: add file logging for background errors - By [Jianqi Pan](mailto:jannchie@gmail.com) in [54bdcf1](https://github.com/codetime-dev/codetime-cli/commit/54bdcf1)
+- **release**: switch release tags to v prefix - By [Jianqi Pan](mailto:jannchie@gmail.com) in [674ccf5](https://github.com/codetime-dev/codetime-cli/commit/674ccf5)
+
 ## v0.3.0
 
 [v0.2.1...v0.3.0](https://github.com/codetime-dev/codetime-cli/compare/v0.2.1...v0.3.0)
