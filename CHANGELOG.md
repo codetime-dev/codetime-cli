@@ -1,3 +1,11 @@
+## v0.3.2
+
+[v0.3.1...v0.3.2](https://github.com/codetime-dev/codetime-cli/compare/v0.3.1...v0.3.2)
+
+### :adhesive_bandage: Fixes
+
+- **backfill**: add amp backfill source support - By [Jianqi Pan](mailto:jannchie@gmail.com) in [a25dc3c](https://github.com/codetime-dev/codetime-cli/commit/a25dc3c)
+
 ## v0.3.1
 
 [v0.3.0...v0.3.1](https://github.com/codetime-dev/codetime-cli/compare/v0.3.0...v0.3.1)
