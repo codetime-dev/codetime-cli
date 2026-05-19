@@ -1,3 +1,11 @@
+## v0.3.3
+
+[v0.3.2...v0.3.3](https://github.com/codetime-dev/codetime-cli/compare/v0.3.2...v0.3.3)
+
+### :wrench: Chores
+
+- **versioning**: bump version to 0.3.3 - By [Jannchie](mailto:jannchie@gmail.com) in [b8f65a1](https://github.com/codetime-dev/codetime-cli/commit/b8f65a1)
+
 ## v0.3.2
 
 [v0.3.1...v0.3.2](https://github.com/codetime-dev/codetime-cli/compare/v0.3.1...v0.3.2)
