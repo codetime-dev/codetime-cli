@@ -1253,7 +1253,11 @@ const SAMPLE_CODEX_SESSION = [
   }),
 ].join('\n')
 
-test('codex parser appends -fast to model when config.toml has service_tier="fast"', async () => {
+test('codex parser does NOT append -fast when config.toml has service_tier="fast" but the session has no per-turn evidence', async () => {
+  // Regression: prior versions read CODEX_HOME/config.toml once per backfill
+  // and stamped every historical model.usage with -fast, which retroactively
+  // re-classified old standard-tier sessions as fast whenever the user later
+  // enabled fast. Only per-turn evidence inside the session counts now.
   const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
   const sessionsDir = path.join(codexHome, 'sessions', 'p')
   await mkdir(sessionsDir, { recursive: true })
@@ -1265,19 +1269,30 @@ test('codex parser appends -fast to model when config.toml has service_tier="fas
   const usage = events.filter(event => event.type === 'model.usage')
   assert.ok(usage.length > 0, 'expected at least one model.usage')
   for (const event of usage) {
-    assert.equal(event.model, 'gpt-5-codex-fast')
+    assert.equal(event.model, 'gpt-5-codex')
   }
 })
 
-test('codex parser maps service_tier="priority" to the -fast model variant', async () => {
-  // Codex's "priority" is the second flavor of fast inference; ccusage maps both
-  // to its single "fast" speed bucket. We do the same so backend pricing stays simple.
+test('codex parser appends -fast when turn_context carries service_tier="fast"', async () => {
   const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
   const sessionsDir = path.join(codexHome, 'sessions', 'p')
   await mkdir(sessionsDir, { recursive: true })
-  await writeFile(path.join(codexHome, 'config.toml'), 'service_tier = "priority"\n', 'utf8')
   const sessionPath = path.join(sessionsDir, 'session.jsonl')
-  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+  await writeFile(sessionPath, [
+    JSON.stringify({ timestamp: '2026-05-13T09:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5-codex', service_tier: 'fast' } }),
+    JSON.stringify({
+      timestamp: '2026-05-13T09:01:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          model: 'gpt-5-codex',
+          last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+          total_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+        },
+      },
+    }),
+  ].join('\n'), 'utf8')
 
   const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
   const usage = events.filter(event => event.type === 'model.usage')
@@ -1287,14 +1302,60 @@ test('codex parser maps service_tier="priority" to the -fast model variant', asy
   }
 })
 
-test('codex parser keeps bare model name when config.toml omits service_tier', async () => {
+test('codex parser maps per-turn service_tier="priority" to the -fast model variant', async () => {
+  // Codex's "priority" is the second flavor of fast inference; ccusage maps
+  // both to its single "fast" speed bucket. Backend pricing keys on model only.
   const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
   const sessionsDir = path.join(codexHome, 'sessions', 'p')
   await mkdir(sessionsDir, { recursive: true })
-  // config.toml exists but has no service_tier — must NOT append -fast.
-  await writeFile(path.join(codexHome, 'config.toml'), 'model = "gpt-5-codex"\n', 'utf8')
   const sessionPath = path.join(sessionsDir, 'session.jsonl')
-  await writeFile(sessionPath, SAMPLE_CODEX_SESSION, 'utf8')
+  await writeFile(sessionPath, [
+    JSON.stringify({ timestamp: '2026-05-13T09:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5-codex', service_tier: 'priority' } }),
+    JSON.stringify({
+      timestamp: '2026-05-13T09:01:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          model: 'gpt-5-codex',
+          last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+          total_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+        },
+      },
+    }),
+  ].join('\n'), 'utf8')
+
+  const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
+  const usage = events.filter(event => event.type === 'model.usage')
+  assert.ok(usage.length > 0)
+  for (const event of usage) {
+    assert.equal(event.model, 'gpt-5-codex-fast')
+  }
+})
+
+test('codex parser ignores config.toml fast when the turn explicitly says default', async () => {
+  // Mixed scenario: user has fast on now (config.toml), but an old turn
+  // explicitly recorded service_tier="default". The turn wins — no -fast.
+  const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
+  const sessionsDir = path.join(codexHome, 'sessions', 'p')
+  await mkdir(sessionsDir, { recursive: true })
+  await writeFile(path.join(codexHome, 'config.toml'), 'service_tier = "fast"\n', 'utf8')
+  const sessionPath = path.join(sessionsDir, 'session.jsonl')
+  await writeFile(sessionPath, [
+    JSON.stringify({ timestamp: '2026-05-13T09:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5-codex', service_tier: 'default' } }),
+    JSON.stringify({
+      timestamp: '2026-05-13T09:01:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          model: 'gpt-5-codex',
+          last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+          total_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, reasoning_output_tokens: 5, total_tokens: 150 },
+        },
+      },
+    }),
+  ].join('\n'), 'utf8')
 
   const events = await createCodexAdapter().parseSessionFile!(sessionPath, { _: [] })
   const usage = events.filter(event => event.type === 'model.usage')
@@ -1304,8 +1365,7 @@ test('codex parser keeps bare model name when config.toml omits service_tier', a
   }
 })
 
-test('codex parser handles missing config.toml gracefully', async () => {
-  // No config.toml at all — common when CODEX_HOME is fresh.
+test('codex parser keeps bare model name when neither config.toml nor session evidence is present', async () => {
   const codexHome = await mkdtemp(path.join(tmpdir(), 'codex-home-'))
   const sessionsDir = path.join(codexHome, 'sessions', 'p')
   await mkdir(sessionsDir, { recursive: true })

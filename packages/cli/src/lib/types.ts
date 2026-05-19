@@ -30,12 +30,14 @@ export interface BackfillSourceFile {
 // Bump `BACKFILL_STATE_SCHEMA_VERSION` whenever the offline parsers
 // change in a way that invalidates already-uploaded rollups (e.g. the
 // Claude assistant-message dedup added in v2, the Codex fast/priority
-// model-name rewrite added in v3). The CLI compares the constant against
-// the on-disk schema; on a mismatch it drops every watermark so the next
-// sync silently re-parses all jsonl from scratch and upserts the rebuilt
-// rollups (`replace: true` is already set). Users get the fix
-// transparently the next time their agent runs.
-export const BACKFILL_STATE_SCHEMA_VERSION = 3
+// model-name rewrite added in v3, and the v4 fix that stops inferring
+// Codex fast/priority from CODEX_HOME/config.toml — it now requires
+// per-turn evidence inside the session itself). The CLI compares the
+// constant against the on-disk schema; on a mismatch it drops every
+// watermark so the next sync silently re-parses all jsonl from scratch
+// and upserts the rebuilt rollups (`replace: true` is already set).
+// Users get the fix transparently the next time their agent runs.
+export const BACKFILL_STATE_SCHEMA_VERSION = 4
 
 export interface BackfillIncrementalState {
   version: typeof BACKFILL_STATE_SCHEMA_VERSION

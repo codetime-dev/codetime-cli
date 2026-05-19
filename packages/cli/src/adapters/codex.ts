@@ -2,6 +2,13 @@ import type { CanonicalEvent } from '@codetime/shared'
 import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+// Codex's fast/priority service_tier costs ~2× standard, so we encode the tier
+// into the model name (e.g. `gpt-5-codex-fast`) so the backend pricing table
+// resolves to the tier-specific entry. We only trust per-turn evidence inside
+// the session file itself — never the current `config.toml`. The old behavior
+// (read CODEX_HOME/config.toml once, stamp every historical model.usage with
+// `-fast`) caused false positives whenever a user enabled fast later, because
+// every old session would be retroactively re-classified on the next backfill.
 import {
   AGENT_TIME_SCHEMA_VERSION,
   createStableHash,
@@ -36,13 +43,14 @@ async function parseCodexSessionFile(
   const text = await readFile(filePath, 'utf8')
   const lines = text.split('\n').filter(Boolean)
   const sourcePathHash = `sha256:${createStableHash(filePath)}`
-  // service_tier=fast|priority encoded into model name (see rewriteCodexModelForTier).
-  const serviceTier = await resolveCodexServiceTier(filePath)
   const events: CanonicalEvent[] = []
   let sessionId = sessionIdFromFilePath(filePath, 'codex')
   let cwd: string | undefined
   let project: string | undefined
   let model: string | undefined
+  // Per-turn service tier. Updated whenever a turn_context (or future per-turn
+  // event) carries an explicit service_tier; never inferred from config.toml.
+  let serviceTier: string | undefined
   let currentTurnId: string | undefined
   let lastTurnIdForComplete: string | undefined
   // Track the turn_id that was active when the previous user_message arrived. Older Codex
@@ -104,6 +112,14 @@ async function parseCodexSessionFile(
       cwd = stringField(payload, 'cwd') || cwd
       project = cwd ? path.basename(cwd) : project
       model = stringField(payload, 'model') || model
+      // Codex hasn't shipped service_tier inside turn_context yet, but the field
+      // is the natural per-turn location and the upstream protocol allows it.
+      // Honor it when present so future Codex builds get accurate fast/priority
+      // attribution without another parser change.
+      const tier = stringField(payload, 'service_tier')
+      if (tier) {
+        serviceTier = tier.toLowerCase()
+      }
       continue
     }
 
@@ -168,6 +184,13 @@ async function parseCodexSessionFile(
         break
       }
       case 'token_count': {
+        // Some Codex builds carry service_tier alongside last_token_usage, so
+        // pick it up here too as a secondary per-turn signal.
+        const info = objectField(payload, 'info')
+        const tierFromInfo = stringField(info, 'service_tier') || stringField(payload, 'service_tier')
+        if (tierFromInfo) {
+          serviceTier = tierFromInfo.toLowerCase()
+        }
         const usage = tokenUsageFromPayload(payload)
         if (usage) {
           const usageKey = [
@@ -399,59 +422,6 @@ async function parseCodexSessionFile(
 
 // ── Codex-specific helpers ──
 
-// Module-level cache: a single backfill run touches many session files under
-// the same CODEX_HOME — read config.toml once per home, not per file.
-const codexServiceTierCache = new Map<string, string | null>()
-
-async function resolveCodexServiceTier(sessionFilePath: string): Promise<string | undefined> {
-  const home = inferCodexHomeFromSessionPath(sessionFilePath)
-  if (!home) {
-    return undefined
-  }
-  if (!codexServiceTierCache.has(home)) {
-    codexServiceTierCache.set(home, await readCodexServiceTier(home))
-  }
-  return codexServiceTierCache.get(home) ?? undefined
-}
-
-// Codex session files live at <CODEX_HOME>/sessions/<...>/<file>.jsonl or
-// <CODEX_HOME>/history.jsonl. Walk parents until we hit the `sessions/` segment
-// or land on the history file's parent — either points at CODEX_HOME.
-function inferCodexHomeFromSessionPath(sessionFilePath: string): string | undefined {
-  if (path.basename(sessionFilePath) === 'history.jsonl') {
-    return path.dirname(sessionFilePath)
-  }
-  let dir = path.dirname(sessionFilePath)
-  for (let depth = 0; depth < 10; depth += 1) {
-    const parent = path.dirname(dir)
-    if (parent === dir) {
-      return undefined
-    }
-    if (path.basename(dir) === 'sessions') {
-      return parent
-    }
-    dir = parent
-  }
-  return undefined
-}
-
-async function readCodexServiceTier(codexHomePath: string): Promise<string | null> {
-  try {
-    const text = await readFile(path.join(codexHomePath, 'config.toml'), 'utf8')
-    // Match `service_tier = "fast"` / `service_tier='priority'` / `service_tier=fast`
-    // anywhere in the file. ccusage uses a similar regex for the same purpose.
-    const match = text.match(/(?:^|\n)\s*service_tier\s*=\s*["']?([a-z_]+)["']?/i)
-    return match ? match[1].toLowerCase() : null
-  }
-  catch {
-    return null
-  }
-}
-
-// Codex's fast/priority service_tier costs ~2× standard. Like Claude Code's
-// `-fast` Opus suffix, we encode the tier into the model name so the backend
-// pricing table (which keys on model only) resolves to the tier-specific
-// entry without plumbing extra fields through SessionModelRollup.
 function rewriteCodexModelForTier(model: string | undefined, serviceTier: string | undefined): string | undefined {
   if (!model) {
     return model
