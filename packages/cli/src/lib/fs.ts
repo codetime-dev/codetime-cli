@@ -127,10 +127,18 @@ export async function countDirectoryEntries(candidatePath: string): Promise<numb
           const { DatabaseSync } = await import('node:sqlite')
           const db = new DatabaseSync(candidatePath, { readOnly: true })
           try {
-            const result = db.prepare(
-              'SELECT count(*) as cnt FROM session WHERE time_created IS NOT NULL',
-            ).get() as { cnt: number }
-            return result?.cnt || 0
+            const tables = db.prepare('SELECT name FROM sqlite_master WHERE type = \'table\'').all() as Array<{ name: string }>
+            if (tables.some(table => table.name === 'session')) {
+              const result = db.prepare(
+                'SELECT count(*) as cnt FROM session WHERE time_created IS NOT NULL',
+              ).get() as { cnt: number }
+              return result?.cnt || 0
+            }
+            if (tables.some(table => table.name === 'sessions')) {
+              const result = db.prepare('SELECT count(*) as cnt FROM sessions').get() as { cnt: number }
+              return result?.cnt || 0
+            }
+            return 1
           }
           finally {
             db.close()
@@ -142,8 +150,12 @@ export async function countDirectoryEntries(candidatePath: string): Promise<numb
       }
       return 1
     }
-    // Count both .jsonl (codex/claude/pi sessions) and .json (Amp threads)
-    // so adapters with different on-disk formats both surface accurate counts.
+    // Count .jsonl (codex/claude/pi sessions), .json (Amp threads), and
+    // Hermes' state.db so adapters with different on-disk formats surface
+    // accurate counts.
+    if (candidatePath.endsWith('.db')) {
+      return await pathExists(candidatePath) ? 1 : 0
+    }
     const files = await listFilesByExtensions(candidatePath, ['.jsonl', '.json'])
     return files.length
   }

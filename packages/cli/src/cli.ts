@@ -22,6 +22,7 @@ import { cac } from 'cac'
 import { ampBackfillFiles, createAmpAdapter } from './adapters/amp.js'
 import { createClaudeCodeAdapter } from './adapters/claude-code.js'
 import { createCodexAdapter } from './adapters/codex.js'
+import { createHermesAdapter, hermesBackfillFiles } from './adapters/hermes.js'
 import { createOpenCodeAdapter, opencodeBackfillFiles } from './adapters/opencode.js'
 import { createPiAdapter } from './adapters/pi.js'
 import { AdapterRegistry } from './adapters/registry.js'
@@ -53,6 +54,7 @@ function createRegistry(): AdapterRegistry {
   registry.register(createPiAdapter())
   registry.register(createOpenCodeAdapter())
   registry.register(createAmpAdapter())
+  registry.register(createHermesAdapter())
   return registry
 }
 
@@ -604,6 +606,9 @@ async function listBackfillSourceFiles(
   }
   if (source.id === 'amp') {
     return ampBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+  }
+  if (source.id === 'hermes') {
+    return hermesBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
   }
 
   const roots = stringOption(options['source-root'])

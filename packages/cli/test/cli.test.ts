@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 // eslint-disable-next-line test/no-import-node-test -- This repo uses node:test as the runner.
 import { test } from 'node:test'
@@ -198,6 +199,46 @@ test('sync-local-runner honors explicit state and lock file paths', async () => 
   assert.equal(typeof state.lastCompletedAt, 'string')
   assert.equal(state.lastExitCode, 0)
   await assert.rejects(readFile(lockPath, 'utf8'), { code: 'ENOENT' })
+})
+
+test('backfill plan imports Hermes state.db usage without prompt text', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await createHermesStateDb(home)
+
+  let output = ''
+  const exitCode = await run(['backfill', 'plan', '--source', 'hermes', '--dry-run', '--json', '--home', home], testContext({
+    stdout: { write: (text) => {
+      output += text
+    } },
+  }))
+
+  assert.equal(exitCode, 0)
+  const parsed = JSON.parse(output)
+  assert.equal(parsed.importRun.source, 'hermes')
+  assert.equal(parsed.candidates[0].source, 'hermes')
+  assert.equal(parsed.candidates[0].entries, 1)
+  const planned = parsed.plannedEvents.filter((event: { source: string }) => event.source === 'hermes')
+  assert.equal(planned.length > 0, true)
+  assert.equal(planned.filter((event: { type: string }) => event.type === 'model.usage').length, 1)
+  assert.equal(output.includes('secret prompt'), false)
+})
+
+test('detect reports Hermes covered when state.db exists', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await createHermesStateDb(home)
+
+  let output = ''
+  const exitCode = await run(['detect', '--json', '--home', home], testContext({
+    stdout: { write: (text) => {
+      output += text
+    } },
+  }))
+
+  assert.equal(exitCode, 0)
+  const parsed = JSON.parse(output)
+  const hermes = parsed.targets.find((target: { id: string }) => target.id === 'hermes')
+  assert.equal(hermes.detected, true)
+  assert.equal(hermes.installed, true)
 })
 
 test('backfill dry-run reports local history candidates without importing', async () => {
@@ -1487,3 +1528,116 @@ test('XDG_DATA_HOME relocates OpenCode backfill source candidates', async () => 
     `expected XDG_DATA_HOME path among ${JSON.stringify(candidatePaths)}`,
   )
 })
+
+async function createHermesStateDb(home: string): Promise<string> {
+  const hermesDir = path.join(home, '.hermes')
+  await mkdir(hermesDir, { recursive: true })
+  const dbPath = path.join(hermesDir, 'state.db')
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        source TEXT NOT NULL,
+        user_id TEXT,
+        model TEXT,
+        model_config TEXT,
+        system_prompt TEXT,
+        parent_session_id TEXT,
+        started_at REAL NOT NULL,
+        ended_at REAL,
+        end_reason TEXT,
+        message_count INTEGER DEFAULT 0,
+        tool_call_count INTEGER DEFAULT 0,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        cache_read_tokens INTEGER DEFAULT 0,
+        cache_write_tokens INTEGER DEFAULT 0,
+        reasoning_tokens INTEGER DEFAULT 0,
+        billing_provider TEXT,
+        billing_base_url TEXT,
+        billing_mode TEXT,
+        estimated_cost_usd REAL,
+        actual_cost_usd REAL,
+        cost_status TEXT,
+        cost_source TEXT,
+        pricing_version TEXT,
+        title TEXT,
+        api_call_count INTEGER DEFAULT 0,
+        handoff_state TEXT,
+        handoff_platform TEXT,
+        handoff_error TEXT
+      );
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        role TEXT NOT NULL,
+        content TEXT,
+        tool_call_id TEXT,
+        tool_calls TEXT,
+        tool_name TEXT,
+        timestamp REAL NOT NULL,
+        token_count INTEGER,
+        finish_reason TEXT,
+        reasoning TEXT,
+        reasoning_content TEXT,
+        reasoning_details TEXT,
+        codex_reasoning_items TEXT,
+        codex_message_items TEXT,
+        platform_message_id TEXT
+      );
+    `)
+    db.prepare(`
+      INSERT INTO sessions (
+        id, source, model, model_config, started_at, ended_at, end_reason,
+        message_count, tool_call_count, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens, reasoning_tokens,
+        billing_provider, estimated_cost_usd, actual_cost_usd, title, api_call_count
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      '20260522_120000_test',
+      'discord',
+      'gpt-5.5',
+      JSON.stringify({ provider: 'openai-codex' }),
+      1_779_400_000,
+      1_779_400_030,
+      'completed',
+      3,
+      1,
+      100,
+      40,
+      10,
+      5,
+      3,
+      'openai-codex',
+      0,
+      0,
+      'Hermes test session',
+      1,
+    )
+    db.prepare(`
+      INSERT INTO messages (session_id, role, content, tool_calls, timestamp, finish_reason)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('20260522_120000_test', 'user', 'secret prompt should not be exported', null, 1_779_400_001, null)
+    db.prepare(`
+      INSERT INTO messages (session_id, role, content, tool_calls, timestamp, finish_reason)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      '20260522_120000_test',
+      'assistant',
+      '',
+      JSON.stringify([{ id: 'call_1', function: { name: 'terminal', arguments: '{}' } }]),
+      1_779_400_002,
+      'tool_calls',
+    )
+    db.prepare(`
+      INSERT INTO messages (session_id, role, content, tool_calls, timestamp, finish_reason)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('20260522_120000_test', 'assistant', 'done', null, 1_779_400_030, 'stop')
+  }
+  finally {
+    db.close()
+  }
+  return dbPath
+}

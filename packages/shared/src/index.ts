@@ -9,6 +9,7 @@ export const KNOWN_AGENT_SOURCES = [
   'opencode',
   'pi',
   'amp',
+  'hermes',
   'generic-cli',
   'manual',
   'unknown',
@@ -110,6 +111,25 @@ export const SOURCE_CAPABILITIES: Record<KnownAgentSource, SourceCapabilities> =
     modelName: 'exact',
     tokenUsage: 'exact',
     toolCalls: 'none',
+    toolTiming: 'none',
+    commandTiming: 'none',
+    fileReads: 'none',
+    fileWrites: 'none',
+    fileDiffStats: 'none',
+    permissionEvents: 'none',
+    transcriptLocator: 'exact',
+  },
+  // Hermes keeps canonical session/message accounting in ~/.hermes/state.db.
+  // The local database exposes exact aggregate usage and session lifecycle,
+  // while prompts/tools are reconstructed from stored message metadata.
+  'hermes': {
+    sessionLifecycle: 'exact',
+    turnLifecycle: 'derived',
+    agentHierarchy: 'none',
+    promptEvents: 'partial',
+    modelName: 'exact',
+    tokenUsage: 'exact',
+    toolCalls: 'partial',
     toolTiming: 'none',
     commandTiming: 'none',
     fileReads: 'none',
@@ -292,7 +312,7 @@ export interface StoredCanonicalEvent extends CanonicalEvent {
   receivedAt: string
 }
 
-export type BackfillSourceId = 'codex' | 'claude-code' | 'opencode' | 'pi' | 'amp'
+export type BackfillSourceId = 'codex' | 'claude-code' | 'opencode' | 'pi' | 'amp' | 'hermes'
 export type ImportRunStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ImportRunRecord {
