@@ -48,6 +48,9 @@ async function parseCodexSessionFile(
   let cwd: string | undefined
   let project: string | undefined
   let model: string | undefined
+  // Headless `codex exec` files have no session_meta; emit a synthetic
+  // session.started on the first usage line so rollups still get a boundary.
+  let sessionStartEmitted = false
   // Per-turn service tier. Updated whenever a turn_context (or future per-turn
   // event) carries an explicit service_tier; never inferred from config.toml.
   let serviceTier: string | undefined
@@ -104,6 +107,7 @@ async function parseCodexSessionFile(
         model,
         confidence: 'exact',
       }, { filePath, sourcePathHash, lineNumber, topType, payloadType: 'session_meta', options }))
+      sessionStartEmitted = true
       continue
     }
 
@@ -119,6 +123,40 @@ async function parseCodexSessionFile(
       const tier = stringField(payload, 'service_tier')
       if (tier) {
         serviceTier = tier.toLowerCase()
+      }
+      continue
+    }
+
+    // Headless `codex exec` output: turn.completed / result / bare {data:{usage}}
+    // lines carry usage directly, with no session_meta/event_msg wrapper.
+    // Mirrors ccusage's headless parser (adapter/codex/parser.rs).
+    if (topType === 'turn.completed' || topType === 'result' || topType === undefined) {
+      const usage = headlessCodexUsage(raw)
+      if (usage) {
+        const parsedModel = headlessCodexModel(raw)
+        if (parsedModel) {
+          model = parsedModel
+        }
+        const eventModel = parsedModel || model || 'gpt-5'
+        const headlessTs = headlessCodexTimestamp(raw) || ts
+        if (!sessionStartEmitted) {
+          events.push(withBackfillRefs(baseCodexEvent({
+            ts: headlessTs,
+            type: 'session.started',
+            sessionId,
+            model: eventModel,
+            confidence: 'derived',
+          }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'session', options }))
+          sessionStartEmitted = true
+        }
+        events.push(withBackfillRefs(baseCodexEvent({
+          ts: headlessTs,
+          type: 'model.usage',
+          sessionId,
+          model: eventModel,
+          confidence: 'partial',
+          metrics: usage,
+        }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'headless', options }))
       }
       continue
     }
@@ -440,6 +478,74 @@ function baseCodexEvent(
     workspaceId: createWorkspaceId({ projectName: event.project, repoRoot: event.cwd }),
     ...event,
   }
+}
+
+// ── Headless codex exec (turn.completed / result / bare data.usage) ──
+
+// Pull usage from the top-level object or a nested data/result/response wrapper,
+// honoring the field aliases ccusage accepts (prompt/completion/cached_tokens).
+function headlessCodexUsage(raw: Record<string, unknown>) {
+  const usage = [
+    objectField(raw, 'usage'),
+    objectField(objectField(raw, 'data'), 'usage'),
+    objectField(objectField(raw, 'result'), 'usage'),
+    objectField(objectField(raw, 'response'), 'usage'),
+  ].find(candidate => Object.keys(candidate).length > 0)
+  if (!usage) {
+    return
+  }
+
+  const input = numberField(usage, 'input_tokens') ?? numberField(usage, 'prompt_tokens') ?? 0
+  const output = numberField(usage, 'output_tokens') ?? numberField(usage, 'completion_tokens') ?? 0
+  const cached = numberField(usage, 'cached_input_tokens')
+    ?? numberField(usage, 'cache_read_input_tokens')
+    ?? numberField(usage, 'cached_tokens')
+    ?? 0
+  const reasoning = numberField(usage, 'reasoning_output_tokens') ?? numberField(usage, 'reasoning_tokens') ?? 0
+  const totalField = numberField(usage, 'total_tokens')
+  // ccusage keeps total_tokens only when positive (or everything is zero),
+  // otherwise recomputes from input+output+reasoning — cache is NOT added.
+  const total = totalField !== undefined && (totalField > 0 || input + output + reasoning === 0)
+    ? totalField
+    : input + output + reasoning
+
+  if (input === 0 && cached === 0 && output === 0 && reasoning === 0 && total === 0) {
+    return
+  }
+
+  return {
+    tokensInput: input || undefined,
+    tokensCachedInput: cached || undefined,
+    tokensOutput: output || undefined,
+    tokensReasoningOutput: reasoning || undefined,
+    tokensTotal: total,
+    modelCalls: 1,
+  }
+}
+
+function headlessCodexModel(raw: Record<string, unknown>): string | undefined {
+  for (const source of [raw, objectField(raw, 'data'), objectField(raw, 'result'), objectField(raw, 'response')]) {
+    const model = stringField(source, 'model') ?? stringField(source, 'model_name')
+    if (model) {
+      return model
+    }
+  }
+  return undefined
+}
+
+function headlessCodexTimestamp(raw: Record<string, unknown>): string | undefined {
+  const data = objectField(raw, 'data')
+  const result = objectField(raw, 'result')
+  const response = objectField(raw, 'response')
+  for (const source of [raw, data, result, response]) {
+    const ts = timestampFrom(source.timestamp)
+      ?? timestampFrom(source.created_at)
+      ?? timestampFrom(source.createdAt)
+    if (ts) {
+      return ts
+    }
+  }
+  return undefined
 }
 
 export function tokenUsageFromPayload(payload: Record<string, unknown>) {

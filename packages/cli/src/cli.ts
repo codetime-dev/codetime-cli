@@ -14,6 +14,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   AGENT_TIME_SCHEMA_VERSION,
+  BACKFILL_SOURCE_IDS,
   createImportKey,
   createPayloadHash,
   createStableHash,
@@ -22,6 +23,7 @@ import { cac } from 'cac'
 import { ampBackfillFiles, createAmpAdapter } from './adapters/amp.js'
 import { createClaudeCodeAdapter } from './adapters/claude-code.js'
 import { createCodexAdapter } from './adapters/codex.js'
+import { createGeminiAdapter, geminiBackfillFiles } from './adapters/gemini.js'
 import { createOpenCodeAdapter, opencodeBackfillFiles } from './adapters/opencode.js'
 import { createPiAdapter } from './adapters/pi.js'
 import { AdapterRegistry } from './adapters/registry.js'
@@ -53,6 +55,7 @@ function createRegistry(): AdapterRegistry {
   registry.register(createPiAdapter())
   registry.register(createOpenCodeAdapter())
   registry.register(createAmpAdapter())
+  registry.register(createGeminiAdapter())
   return registry
 }
 
@@ -423,7 +426,7 @@ async function backfillCommand(options: ParsedArgs, ctx: RunContext, registry?: 
 
   if (action === 'import' && !options['dry-run']) {
     const requested = normalizeBackfillSource(stringOption(options.source) || 'all')
-    const supported = new Set<string>(['all', 'codex', 'claude-code', 'opencode', 'pi', 'amp'])
+    const supported = new Set<string>(['all', ...BACKFILL_SOURCE_IDS])
     if (!supported.has(requested)) {
       write(ctx.stderr, `Unsupported backfill source: ${requested}\n`)
       return 1
@@ -605,6 +608,9 @@ async function listBackfillSourceFiles(
   if (source.id === 'amp') {
     return ampBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
   }
+  if (source.id === 'gemini') {
+    return geminiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+  }
 
   const roots = stringOption(options['source-root'])
     ? [requiredOption(options, 'source-root')]
@@ -693,7 +699,7 @@ async function importBackfillPlan(
   registry: AdapterRegistry,
 ): Promise<number> {
   const source = normalizeBackfillSource(stringOption(options.source) || 'all')
-  const supportedSources = new Set<BackfillSourceId>(['codex', 'claude-code', 'opencode', 'pi', 'amp'])
+  const supportedSources = new Set<BackfillSourceId>(BACKFILL_SOURCE_IDS)
   const home = resolveHome(options, ctx)
   if (source !== 'all' && !supportedSources.has(source as BackfillSourceId)) {
     write(ctx.stderr, `Unsupported backfill source: ${source}\n`)
@@ -1081,7 +1087,7 @@ async function readBackfillIncrementalState(home: string, ctx?: RunContext): Pro
   }
 
   const sources: BackfillIncrementalState['sources'] = {}
-  for (const source of ['codex', 'claude-code', 'opencode', 'pi', 'amp'] as const) {
+  for (const source of BACKFILL_SOURCE_IDS) {
     const item = state.sources[source]
     if (isPlainObject(item) && typeof item.watermarkTs === 'string' && !Number.isNaN(Date.parse(item.watermarkTs))) {
       sources[source] = { watermarkTs: item.watermarkTs }

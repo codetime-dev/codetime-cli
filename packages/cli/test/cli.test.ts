@@ -1,3 +1,4 @@
+import type { RunContext } from '../src/lib/types.ts'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -14,7 +15,7 @@ test('detect reports installed Codex hook', async () => {
 
   let output = ''
   const exitCode = await run(['detect', '--json', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -32,7 +33,7 @@ test('detect only marks Codex installed when codetime hook exists', async () => 
 
   let output = ''
   const exitCode = await run(['detect', '--json', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -75,10 +76,10 @@ test('hook triggers a sync-local-runner without parsing the payload', async () =
 
   const exitCode = await run(['hook', '--agent', 'codex', '--home', home], testContext({
     stdin,
-    spawn: (command: string, args: string[]) => {
+    spawn: ((command: string, args: string[]) => {
       spawns.push({ command, args })
       return { pid: 43_210, unref() {} } as never
-    },
+    }) as unknown as RunContext['spawn'],
   }))
 
   assert.equal(exitCode, 0)
@@ -105,7 +106,7 @@ test('hook --dry-run echoes the payload without triggering backfill', async () =
       spawns.push(1)
       return { pid: 1, unref() {} } as never
     },
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -140,7 +141,7 @@ test('sync-local-trigger throttles repeated triggers', async () => {
   let output = ''
 
   const exitCode = await run(['sync-local-trigger', '--home', home, '--min-interval', '60', '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -160,7 +161,7 @@ test('sync-local-trigger detects an already running sync', async () => {
   let output = ''
 
   const exitCode = await run(['sync-local-trigger', '--home', home, '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -215,7 +216,7 @@ test('backfill dry-run reports local history candidates without importing', asyn
 
   let output = ''
   const exitCode = await run(['backfill', 'plan', '--source', 'codex', '--dry-run', '--json', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -233,7 +234,7 @@ test('backfill plan parses Codex sessions without leaking transcript text', asyn
 
   let output = ''
   const exitCode = await run(['backfill', 'plan', '--source', 'codex', '--dry-run', '--json', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -258,7 +259,7 @@ test('backfill plan text output is bounded', async () => {
 
   let output = ''
   const exitCode = await run(['backfill', 'plan', '--source', 'codex', '--dry-run', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -289,7 +290,7 @@ test('backfill plan honors the limit option', async () => {
 
   let output = ''
   const exitCode = await run(['backfill', 'plan', '--source', 'codex', '--dry-run', '--json', '--home', home, '--limit', '1'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -387,7 +388,7 @@ test('backfill import sends parsed Codex events and counts API results', async (
   let output = ''
 
   const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
     fetch: async (url, init) => {
@@ -425,7 +426,7 @@ test('backfill import text output reports bounded progress', async () => {
   let output = ''
 
   const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--batch-size', '2'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
     fetch: async (_url, init) => {
@@ -485,7 +486,7 @@ test('backfill import handles large Codex event batches', async () => {
   let batches = 0
 
   const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--batch-size', '50000', '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
     fetch: async (_url, init) => {
@@ -507,7 +508,7 @@ test('backfill import skips unchanged session files after the watermark advances
   const home = await createIncrementalCodexBackfillHome()
   const calls: Array<{ url: string, body: string }> = []
 
-  const fetch = async (url: string | URL, init?: RequestInit) => {
+  const fetch: RunContext['fetch'] = async (url, init) => {
     calls.push({ url: String(url), body: String(init?.body) })
     const rollups = JSON.parse(String(init?.body)).rollups
     return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
@@ -528,7 +529,7 @@ test('backfill import reparses a changed session file from its earliest event', 
   const home = await createIncrementalCodexBackfillHome()
   const calls: Array<{ url: string, body: string }> = []
 
-  const fetch = async (url: string | URL, init?: RequestInit) => {
+  const fetch: RunContext['fetch'] = async (url, init) => {
     calls.push({ url: String(url), body: String(init?.body) })
     const rollups = JSON.parse(String(init?.body)).rollups
     return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
@@ -592,7 +593,7 @@ test('backfill plan parses Claude Code sessions without leaking transcript text'
 
   let output = ''
   const exitCode = await run(['backfill', 'plan', '--source', 'claude-code', '--dry-run', '--json', '--home', home], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -624,7 +625,7 @@ test('backfill import sends parsed Claude Code events and counts API results', a
   let output = ''
 
   const exitCode = await run(['backfill', 'import', '--source', 'claude-code', '--home', home, '--api-url', 'http://example.test', '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
     fetch: async (url, init) => {
@@ -666,7 +667,7 @@ test('backfill import sends parsed Claude Code events and counts API results', a
 test('backfill verify reports placeholder status for import runs', async () => {
   let output = ''
   const exitCode = await run(['backfill', 'verify', '--import-run', 'import_123', '--json'], testContext({
-    stdout: { write: (text) => {
+    stdout: { write: (text: string) => {
       output += text
     } },
   }))
@@ -1106,14 +1107,14 @@ async function createClaudeBackfillHome() {
   return home
 }
 
-function testContext(overrides = {}) {
+function testContext(overrides: Partial<RunContext> = {}): Partial<RunContext> {
   return {
     env: { HOME: tmpdir() },
     stdin: Readable.from([]),
     stdout: { write: () => {} },
     stderr: { write: () => {} },
-    fetch: async () => Response.json({ data: {} }, { status: 201 }),
-    spawn: () => ({ pid: 12_345, unref() {} }),
+    fetch: (async () => Response.json({ data: {} }, { status: 201 })) as unknown as RunContext['fetch'],
+    spawn: (() => ({ pid: 12_345, unref() {} })) as unknown as RunContext['spawn'],
     ...overrides,
   }
 }

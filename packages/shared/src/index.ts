@@ -9,6 +9,7 @@ export const KNOWN_AGENT_SOURCES = [
   'opencode',
   'pi',
   'amp',
+  'gemini',
   'generic-cli',
   'manual',
   'unknown',
@@ -108,6 +109,25 @@ export const SOURCE_CAPABILITIES: Record<KnownAgentSource, SourceCapabilities> =
     agentHierarchy: 'none',
     promptEvents: 'none',
     modelName: 'exact',
+    tokenUsage: 'exact',
+    toolCalls: 'none',
+    toolTiming: 'none',
+    commandTiming: 'none',
+    fileReads: 'none',
+    fileWrites: 'none',
+    fileDiffStats: 'none',
+    permissionEvents: 'none',
+    transcriptLocator: 'exact',
+  },
+  // Gemini CLI writes per-session JSON/JSONL logs under ~/.gemini/tmp with token
+  // counts only; no tool/file/cwd telemetry, so timing is derived from message
+  // timestamps and everything else is absent.
+  'gemini': {
+    sessionLifecycle: 'derived',
+    turnLifecycle: 'none',
+    agentHierarchy: 'none',
+    promptEvents: 'none',
+    modelName: 'partial',
     tokenUsage: 'exact',
     toolCalls: 'none',
     toolTiming: 'none',
@@ -292,7 +312,8 @@ export interface StoredCanonicalEvent extends CanonicalEvent {
   receivedAt: string
 }
 
-export type BackfillSourceId = 'codex' | 'claude-code' | 'opencode' | 'pi' | 'amp'
+export const BACKFILL_SOURCE_IDS = ['codex', 'claude-code', 'opencode', 'pi', 'amp', 'gemini'] as const
+export type BackfillSourceId = typeof BACKFILL_SOURCE_IDS[number]
 export type ImportRunStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 
 export interface ImportRunRecord {
