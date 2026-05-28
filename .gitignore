@@ -40,3 +40,4 @@ Thumbs.db
 
 # Runtime CLI state (in case someone runs the CLI from inside the repo)
 .codetime/
+docs

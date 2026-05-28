@@ -1,3 +1,11 @@
+## v0.4.0
+
+[v0.3.3...v0.4.0](https://github.com/codetime-dev/codetime-cli/compare/v0.3.3...v0.4.0)
+
+### :sparkles: Features
+
+- **cli**: add gemini backfill support - By [Jianqi Pan](mailto:jannchie@gmail.com) in [b25e217](https://github.com/codetime-dev/codetime-cli/commit/b25e217)
+
 ## v0.3.3
 
 [v0.3.2...v0.3.3](https://github.com/codetime-dev/codetime-cli/compare/v0.3.2...v0.3.3)
