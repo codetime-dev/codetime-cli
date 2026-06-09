@@ -119,9 +119,49 @@ export async function deleteRollupsBySource(
   return Number(body.deleted) || 0
 }
 
-// Device-link helpers (startCliLink/pollCliLink) were removed when the
-// CLI moved to reusing the user's upload_token via `codetime token
-// set <token>`. The server no longer exposes `/v3/agent/cli/link/*`.
+// ── Device-code login ──
+// Browser-based `codetime login`: /start mints a code pair, the user
+// approves it in a signed-in browser tab, and /poll returns the token
+// once approved. The server side lives in
+// codetime-web-v3/server/routes/v3/agent/cli/link/.
+
+export interface CliLinkStart {
+  deviceCode: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete: string
+  interval: number
+  expiresIn: number
+}
+
+export type CliLinkPoll
+  = | { status: 'pending' }
+  | { status: 'approved', token: string, userId?: number }
+  | { status: 'expired' }
+
+export async function startCliLink(remote: RemoteOptions): Promise<CliLinkStart> {
+  const response = await remote.fetchImpl(joinUrl(remote.baseUrl, '/v3/agent/cli/link/start'), {
+    method: 'POST',
+    headers: buildHeaders(),
+    body: '{}',
+  })
+  if (!response.ok) {
+    throw new Error(`Failed to start login: ${response.status}`)
+  }
+  return await response.json() as CliLinkStart
+}
+
+export async function pollCliLink(remote: RemoteOptions, deviceCode: string): Promise<CliLinkPoll> {
+  const response = await remote.fetchImpl(joinUrl(remote.baseUrl, '/v3/agent/cli/link/poll'), {
+    method: 'POST',
+    headers: buildHeaders(),
+    body: JSON.stringify({ deviceCode }),
+  })
+  if (!response.ok) {
+    throw new Error(`Login poll failed: ${response.status}`)
+  }
+  return await response.json() as CliLinkPoll
+}
 
 export interface MachineRow {
   id: string

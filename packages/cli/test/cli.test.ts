@@ -1488,3 +1488,90 @@ test('XDG_DATA_HOME relocates OpenCode backfill source candidates', async () => 
     `expected XDG_DATA_HOME path among ${JSON.stringify(candidatePaths)}`,
   )
 })
+
+// Mock the device-code endpoints: /start hands back a fixed code pair,
+// /poll replays the supplied statuses in order (repeating the last).
+function linkFetch(pollStatuses: Array<Record<string, unknown>>) {
+  const requests: Array<{ url: string, body: string }> = []
+  let pollIdx = 0
+  const impl = (async (url: string, init?: { body?: string }) => {
+    const u = String(url)
+    requests.push({ url: u, body: typeof init?.body === 'string' ? init.body : '' })
+    if (u.endsWith('/v3/agent/cli/link/start')) {
+      return Response.json({
+        deviceCode: 'device-secret-1',
+        userCode: 'WXYZ2345',
+        verificationUri: 'https://codetime.dev/cli/auth',
+        verificationUriComplete: 'https://codetime.dev/cli/auth?code=WXYZ2345',
+        interval: 1,
+        expiresIn: 600,
+      })
+    }
+    if (u.endsWith('/v3/agent/cli/link/poll')) {
+      const status = pollStatuses[Math.min(pollIdx, pollStatuses.length - 1)]
+      pollIdx += 1
+      return Response.json(status)
+    }
+    throw new Error(`unexpected url ${u}`)
+  }) as unknown as RunContext['fetch']
+  return { impl, requests }
+}
+
+test('login polls the device-code endpoint and saves the approved token', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  let output = ''
+  const { impl, requests } = linkFetch([{ status: 'approved', token: 'upload_abc123', userId: 7 }])
+
+  const exitCode = await run(['login', '--no-browser', '--home', home], testContext({
+    env: { HOME: home },
+    fetch: impl,
+    stdout: { write: (text: string) => {
+      output += text
+    } },
+  }))
+
+  assert.equal(exitCode, 0)
+  // The printed URL + code let an SSH user open it on another device.
+  assert.match(output, /\/cli\/auth\?code=WXYZ2345/)
+  assert.match(output, /WXYZ2345/)
+  // start is POSTed before any poll.
+  assert.ok(requests[0].url.endsWith('/v3/agent/cli/link/start'))
+  assert.ok(requests.some(r => r.url.endsWith('/v3/agent/cli/link/poll') && r.body.includes('device-secret-1')))
+
+  const config = JSON.parse(await readFile(path.join(home, '.codetime', 'config.json'), 'utf8'))
+  assert.equal(config.token, 'upload_abc123')
+  assert.equal(config.userId, '7')
+})
+
+test('login keeps polling while pending, then saves on approval', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const { impl } = linkFetch([
+    { status: 'pending' },
+    { status: 'approved', token: 'tok_2', userId: 9 },
+  ])
+
+  const exitCode = await run(['login', '--no-browser', '--home', home], testContext({
+    env: { HOME: home },
+    fetch: impl,
+    stdout: { write: () => {} },
+  }))
+
+  assert.equal(exitCode, 0)
+  const config = JSON.parse(await readFile(path.join(home, '.codetime', 'config.json'), 'utf8'))
+  assert.equal(config.token, 'tok_2')
+})
+
+test('login fails and writes no token when the code expires', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const { impl } = linkFetch([{ status: 'expired' }])
+
+  const exitCode = await run(['login', '--no-browser', '--home', home], testContext({
+    env: { HOME: home },
+    fetch: impl,
+    stdout: { write: () => {} },
+    stderr: { write: () => {} },
+  }))
+
+  assert.equal(exitCode, 1)
+  await assert.rejects(readFile(path.join(home, '.codetime', 'config.json'), 'utf8'), { code: 'ENOENT' })
+})

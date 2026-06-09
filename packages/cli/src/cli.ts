@@ -35,14 +35,17 @@ import { DEFAULT_API_URL, DEFAULT_BACKFILL_BATCH_BYTES, DEFAULT_BACKFILL_BATCH_S
 import { isPlainObject, numberOption, stringOption, valuesOption } from './lib/fields.js'
 import { countDirectoryEntries, listJsonlFiles, pathExists, readJsonIfExists } from './lib/fs.js'
 import { logError } from './lib/logger.js'
+import { isHeadless, openBrowser, sleep } from './lib/login.js'
 import { ProgressBar } from './lib/progress.js'
 import {
   deleteMachine,
   deleteRollupsBySource,
   listMachines,
+  pollCliLink,
   postRollupBatch,
   renameMachine,
   resolveRemote,
+  startCliLink,
 } from './lib/remote.js'
 import { BACKFILL_STATE_SCHEMA_VERSION } from './lib/types.js'
 
@@ -172,9 +175,18 @@ function createCli(ctx: RunContext, registry: AdapterRegistry) {
     .option('--force', 'Force full re-import: clear watermark and re-process all files')
     .action((action, options) => backfillCommand({ ...normalizeOptions(options), action }, ctx, registry))
 
-  // `token` is the only path to set credentials — the agent CLI reuses
+  // Browser login (device-code flow): opens `<remote>/cli/auth?code=…`,
+  // polls until the user approves it there, then writes the upload token
+  // to config — the one-click alternative to `token set`. Works over SSH
+  // too: open the printed URL on any device. See lib/login.ts + remote.ts.
+  cli.command('login', 'Authorize this machine by signing in through your browser')
+    .option('--remote <url>', 'Override API base URL for this login')
+    .option('--no-browser', 'Print the login URL instead of opening a browser')
+    .action(options => loginCommand(normalizeOptions(options), ctx))
+
+  // `token` is the manual alternative to `login`: the agent CLI reuses
   // the user's existing upload_token (visible in the codetime
-  // dashboard's Settings page), so there is no device-flow login.
+  // dashboard's Settings page).
   //   token set <value>   write to ~/.codetime/config.json
   //   token show          print masked token + remoteUrl
   //   token clear         remove only the token (keep remoteUrl)
@@ -1320,6 +1332,91 @@ function maskToken(token: string): string {
   return `${token.slice(0, 3)}…${token.slice(-4)}`
 }
 
+// Hard ceiling on how long we keep polling, independent of the server's
+// advertised expiry, so a misbehaving server can't pin the CLI forever.
+const LOGIN_MAX_WAIT_MS = 15 * 60 * 1000
+
+async function loginCommand(options: ParsedArgs, ctx: RunContext): Promise<number> {
+  const home = resolveHome(options, ctx)
+  const remoteOverride = stringOption(options.remote) || stringOption(options['api-url'])
+  const existing = readConfig(home)
+  const baseUrl = (remoteOverride
+    || ctx.env.CODETIME_API_URL
+    || existing.remoteUrl
+    || DEFAULT_API_URL).replace(/\/$/, '')
+
+  const remote = resolveRemote({
+    apiUrl: baseUrl,
+    env: ctx.env,
+    fetch: ctx.fetch,
+    homeOverride: home,
+  })
+  if (!remote) {
+    write(ctx.stderr, 'No fetch implementation available.\n')
+    return 1
+  }
+
+  let link
+  try {
+    link = await startCliLink(remote)
+  }
+  catch (error) {
+    write(ctx.stderr, `${(error as Error).message}\n`)
+    return 1
+  }
+
+  // Build the browser URL from the CLI's own base URL rather than the
+  // server-advertised verificationUri, so it stays correct when the API
+  // host and the web origin differ (e.g. local dev on a non-default port).
+  const authUrl = `${baseUrl}/cli/auth?code=${encodeURIComponent(link.userCode)}`
+  const noBrowser = options.browser === false
+  const headless = isHeadless(ctx)
+
+  write(ctx.stdout, `\nTo sign in, visit:\n\n  ${authUrl}\n\nand confirm this code:  ${link.userCode}\n\n`)
+  if (!noBrowser && !headless) {
+    openBrowser(ctx, authUrl)
+  }
+  write(ctx.stdout, 'Waiting for authorization…\n')
+
+  const intervalMs = Math.max(1, link.interval || 4) * 1000
+  const deadline = Date.now() + Math.min(LOGIN_MAX_WAIT_MS, Math.max(1, link.expiresIn || 600) * 1000)
+  while (Date.now() < deadline) {
+    let poll
+    try {
+      poll = await pollCliLink(remote, link.deviceCode)
+    }
+    catch (error) {
+      // Transient network blip — wait and keep polling until the deadline.
+      void error
+      await sleep(intervalMs)
+      continue
+    }
+    if (poll.status === 'pending') {
+      await sleep(intervalMs)
+      continue
+    }
+    if (poll.status === 'expired') {
+      write(ctx.stderr, 'Login code expired before it was approved. Re-run `codetime login`.\n')
+      return 1
+    }
+    // Approved.
+    writeConfig({
+      ...existing,
+      token: poll.token,
+      ...(poll.userId == null ? {} : { userId: String(poll.userId) }),
+      // Persist the host only when explicitly overridden, matching
+      // `token set` so a default-host login never clobbers an earlier
+      // --remote choice.
+      ...(remoteOverride ? { remoteUrl: remoteOverride } : {}),
+    }, home)
+    write(ctx.stdout, `Logged in. Token saved (${maskToken(poll.token)}).\n`)
+    return 0
+  }
+
+  write(ctx.stderr, 'Timed out waiting for authorization. Re-run `codetime login`.\n')
+  return 1
+}
+
 async function tokenCommand(
   action: string | undefined,
   value: string | undefined,
@@ -1440,19 +1537,22 @@ Usage:
   codetime install [--target codex,claude,opencode,pi] [--all] [--dry-run] [--force] [--home <path>]
   codetime hook --agent <name>
   codetime backfill discover|plan|import|verify --source codex|claude-code|opencode|pi|all --dry-run [--json] [--batch-size <count>]
+  codetime login [--no-browser] [--remote <url>]
   codetime token set <token>
   codetime token show
   codetime token clear
 
 Setup:
-  Copy your upload token from https://codetime.dev/dashboard/settings,
-  then run: codetime token set <token>
+  Run: codetime login  (signs in through your browser)
+  Or copy your upload token from https://codetime.dev/dashboard/settings
+  and run: codetime token set <token>
 
 Commands:
   detect    Show supported local targets and install status.
   install   Install integration files into detected or requested targets.
   hook      Read agent hook JSON from stdin and report a throttled event.
   backfill  Discover local history and create metadata-only import plans.
+  login     Authorize this machine by signing in through your browser.
   token     Set, show, or clear the persisted API token.
   machine   List your machines (read-only).
   version   Print CLI version.
