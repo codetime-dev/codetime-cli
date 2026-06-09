@@ -1,3 +1,12 @@
+## v0.5.0
+
+[v0.4.0...v0.5.0](https://github.com/codetime-dev/codetime-cli/compare/v0.4.0...v0.5.0)
+
+### :sparkles: Features
+
+- **cli**: add browser-based login via device-code flow - By [Jianqi Pan](mailto:jannchie@gmail.com) in [a31c3e1](https://github.com/codetime-dev/codetime-cli/commit/a31c3e1)
+- **cli**: add sync command as a shorthand for backfill import - By [Jianqi Pan](mailto:jannchie@gmail.com) in [ec29407](https://github.com/codetime-dev/codetime-cli/commit/ec29407)
+
 ## v0.4.0
 
 [v0.3.3...v0.4.0](https://github.com/codetime-dev/codetime-cli/compare/v0.3.3...v0.4.0)
