@@ -1575,3 +1575,40 @@ test('login fails and writes no token when the code expires', async () => {
   assert.equal(exitCode, 1)
   await assert.rejects(readFile(path.join(home, '.codetime', 'config.json'), 'utf8'), { code: 'ENOENT' })
 })
+
+test('sync uploads local history via the import path', async () => {
+  const home = await createCodexBackfillHome()
+  const calls: Array<{ url: string, body: string }> = []
+
+  // `sync` is sugar for `backfill import --source all`; with codex
+  // fixtures present it must POST rollups to the ingest endpoint.
+  const exitCode = await run(['sync', '--home', home, '--api-url', 'http://example.test'], testContext({
+    stdout: { write: () => {} },
+    fetch: async (url, init) => {
+      const body = String(init?.body)
+      const rollups = JSON.parse(body).rollups
+      calls.push({ url: String(url), body })
+      return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
+    },
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].url, /\/v3\/agent\/ingest$/)
+})
+
+test('sync --dry-run plans without uploading', async () => {
+  const home = await createCodexBackfillHome()
+  const calls: string[] = []
+
+  const exitCode = await run(['sync', '--dry-run', '--home', home, '--api-url', 'http://example.test'], testContext({
+    stdout: { write: () => {} },
+    fetch: async (url) => {
+      calls.push(String(url))
+      return Response.json({}, { status: 200 })
+    },
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(calls.length, 0)
+})

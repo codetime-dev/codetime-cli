@@ -175,6 +175,23 @@ function createCli(ctx: RunContext, registry: AdapterRegistry) {
     .option('--force', 'Force full re-import: clear watermark and re-process all files')
     .action((action, options) => backfillCommand({ ...normalizeOptions(options), action }, ctx, registry))
 
+  // `sync` is the friendly front door to the upload path: it just runs
+  // `backfill import --source all`. Most users want "send my local
+  // history now", and the bare `backfill` defaults to a dry plan — this
+  // removes that surprise without changing backfill's own semantics.
+  cli.command('sync', 'Import and upload all local agent history (shorthand for `backfill import --source all`)')
+    .option('--source <source>', 'Limit to one source (default: all)')
+    .option('--since <time>', 'Only include history after this time')
+    .option('--until <time>', 'Only include history before this time')
+    .option('--project <name>', 'Project filter')
+    .option('--batch-size <count>', 'Max rollups per request (also bounded by --batch-bytes)')
+    .option('--force', 'Force full re-import: clear watermark and re-process all files')
+    .option('--dry-run', 'Print the planned import without uploading')
+    .action((options) => {
+      const opts = normalizeOptions(options)
+      return backfillCommand({ ...opts, action: 'import', source: stringOption(opts.source) || 'all' }, ctx, registry)
+    })
+
   // Browser login (device-code flow): opens `<remote>/cli/auth?code=…`,
   // polls until the user approves it there, then writes the upload token
   // to config — the one-click alternative to `token set`. Works over SSH
@@ -1536,6 +1553,7 @@ Usage:
   codetime detect [--json] [--home <path>]
   codetime install [--target codex,claude,opencode,pi] [--all] [--dry-run] [--force] [--home <path>]
   codetime hook --agent <name>
+  codetime sync [--source <source>] [--force] [--dry-run]
   codetime backfill discover|plan|import|verify --source codex|claude-code|opencode|pi|all --dry-run [--json] [--batch-size <count>]
   codetime login [--no-browser] [--remote <url>]
   codetime token set <token>
@@ -1551,6 +1569,7 @@ Commands:
   detect    Show supported local targets and install status.
   install   Install integration files into detected or requested targets.
   hook      Read agent hook JSON from stdin and report a throttled event.
+  sync      Import and upload all local agent history (backfill import --source all).
   backfill  Discover local history and create metadata-only import plans.
   login     Authorize this machine by signing in through your browser.
   token     Set, show, or clear the persisted API token.
