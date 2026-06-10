@@ -6,6 +6,7 @@ import path from 'node:path'
 // eslint-disable-next-line test/no-import-node-test -- This repo uses node:test as the runner.
 import { test } from 'node:test'
 import { createCodexAdapter } from '../src/adapters/codex.ts'
+import { buildSessionRollups } from '../src/backfill/rollup.ts'
 
 const adapter = createCodexAdapter()
 
@@ -19,6 +20,102 @@ async function parse(records: unknown[]): Promise<CanonicalEvent[]> {
 function usageEvents(events: CanonicalEvent[]): CanonicalEvent[] {
   return events.filter(event => event.type === 'model.usage')
 }
+
+function turnCompletedEvents(events: CanonicalEvent[]): CanonicalEvent[] {
+  return events.filter(event => event.type === 'turn.completed')
+}
+
+// Synthetic single-turn CanonicalEvent for rollup tests.
+function turnEvent(sessionId: string, turnId: string, ts: string, type: CanonicalEvent['type']): CanonicalEvent {
+  return {
+    schemaVersion: '2026-04-29',
+    ts,
+    type,
+    source: 'codex',
+    agent: 'codex',
+    sessionId,
+    turnId,
+    refs: { sourcePathHash: `sha256:${sessionId}` },
+  }
+}
+
+// ── turn boundary timestamps (idle time must not inflate turn duration) ──
+
+test('user_message closes the previous turn at that turn last event, not the new prompt', async () => {
+  // Two turns with a 30-minute idle gap between turn 1's last activity and the
+  // second prompt. The implicit close of turn 1 must carry turn 1's own last
+  // event ts, so the idle gap is never folded into turn 1's duration.
+  const events = await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'turn_context', payload: { turn_id: 'turn-1' } },
+    { timestamp: '2026-01-02T00:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'first prompt' } },
+    { timestamp: '2026-01-02T00:00:05.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'reply one' } },
+    // 30 minutes of idle, then a new turn_context + second prompt arrive.
+    { timestamp: '2026-01-02T00:30:05.000Z', type: 'turn_context', payload: { turn_id: 'turn-2' } },
+    { timestamp: '2026-01-02T00:30:05.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'second prompt' } },
+    { timestamp: '2026-01-02T00:30:10.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'reply two' } },
+  ])
+
+  const turn1Id = events.find(event => event.type === 'prompt.submitted')!.turnId
+  assert.equal(turn1Id, 'turn-1')
+  const turn1Completed = turnCompletedEvents(events).filter(event => event.turnId === turn1Id)
+  assert.equal(turn1Completed.length, 1)
+  // turn.completed ts equals turn 1's last activity (the agent_message), NOT the
+  // second prompt's ts.
+  assert.equal(turn1Completed[0].ts, '2026-01-02T00:00:05.000Z')
+
+  const rollup = buildSessionRollups(events)[0]
+  const turn1Rollup = rollup.turnRollups!.find(turn => turn.turnId === turn1Id)!
+  // 1s prompt→agent gap, no 30-minute idle leakage.
+  assert.equal(turn1Rollup.durationMs, 4000)
+  assert.ok(turn1Rollup.durationMs < 30 * 60 * 1000)
+})
+
+test('a turn closed by task_complete is not re-closed by the next user_message', async () => {
+  // task_complete closes turn-1 explicitly; the following user_message must not
+  // emit a second turn.completed for the same turnId.
+  const events = await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'turn_context', payload: { turn_id: 'turn-1' } },
+    { timestamp: '2026-01-02T00:00:01.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'first prompt' } },
+    { timestamp: '2026-01-02T00:00:05.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1', duration_ms: 4000 } },
+    { timestamp: '2026-01-02T00:10:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'second prompt' } },
+  ])
+
+  const turn1Id = events.find(event => event.type === 'prompt.submitted')!.turnId
+  const turn1Completed = turnCompletedEvents(events).filter(event => event.turnId === turn1Id)
+  assert.equal(turn1Completed.length, 1)
+  assert.equal(turn1Completed[0].confidence, 'exact') // the task_complete one
+})
+
+// ── rollup gap-clamped turn duration ──
+
+test('turn duration sums gap-clamped active intervals', () => {
+  // Four events in one turn at offsets 0, +1min, +21min (20-min gap), +23min
+  // (2-min gap). Raw span is 23min but the 20-min gap is clamped to 5min, so the
+  // active duration is 1 + 5 + 2 = 8 minutes.
+  const events: CanonicalEvent[] = [
+    turnEvent('gap-session', 'gap-turn', '2026-01-02T00:00:00.000Z', 'prompt.submitted'),
+    turnEvent('gap-session', 'gap-turn', '2026-01-02T00:01:00.000Z', 'agent.operation'),
+    turnEvent('gap-session', 'gap-turn', '2026-01-02T00:21:00.000Z', 'agent.operation'),
+    turnEvent('gap-session', 'gap-turn', '2026-01-02T00:23:00.000Z', 'turn.completed'),
+  ]
+
+  const rollup = buildSessionRollups(events)[0]
+  const turn = rollup.turnRollups!.find(t => t.turnId === 'gap-turn')!
+  assert.equal(turn.durationMs, (1 + 5 + 2) * 60 * 1000)
+  // Real timestamps are preserved even though duration is clamped.
+  assert.equal(turn.startedAt, '2026-01-02T00:00:00.000Z')
+  assert.equal(turn.lastEventAt, '2026-01-02T00:23:00.000Z')
+})
+
+test('session rollups carry the v2 schemaVersion', () => {
+  const rollup = buildSessionRollups([
+    turnEvent('schema-session', 'schema-turn', '2026-01-02T00:00:00.000Z', 'prompt.submitted'),
+    turnEvent('schema-session', 'schema-turn', '2026-01-02T00:00:01.000Z', 'turn.completed'),
+  ])[0]
+  assert.equal(rollup.schemaVersion, 2)
+})
 
 // ── ccusage parity ──
 //
@@ -102,7 +199,9 @@ test('parity: ccusage codex loads_saved_codex_exec_json_usage', async () => {
 
   // total_tokens=0 is ignored; recomputed = 9 + 4 + 1.
   assert.equal(usages[2].metrics?.tokensInput, 9)
-  assert.equal(usages[2].metrics?.tokensOutput, 4)
+  // ccusage's raw output_tokens=4 excludes reasoning; codetime folds reasoning
+  // into billable tokensOutput → 4 + 1 = 5. tokensReasoningOutput keeps the raw 1.
+  assert.equal(usages[2].metrics?.tokensOutput, 5)
   assert.equal(usages[2].metrics?.tokensReasoningOutput, 1)
   assert.equal(usages[2].metrics?.tokensTotal, 14)
 })

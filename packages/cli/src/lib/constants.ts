@@ -18,4 +18,10 @@ export const DEFAULT_BACKFILL_BATCH_SIZE = 50
 // sent as its own batch and may 413 — that's surfaced to the user.
 export const DEFAULT_BACKFILL_BATCH_BYTES = 800 * 1024
 export const ROLLUP_BUCKET_MS = 15 * 60 * 1000
+// When computing a turn's active duration, a gap between two consecutive events
+// inside the turn that exceeds this is counted as exactly this much. This defends
+// against lazy `completed_at` timestamps and long in-turn silences (e.g. waiting
+// on a slow tool or the user) inflating the duration, while a continuously busy
+// long agentic turn (events closer together than the clamp) is unaffected.
+export const TURN_GAP_CLAMP_MS = 5 * 60 * 1000
 export const DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS = 60

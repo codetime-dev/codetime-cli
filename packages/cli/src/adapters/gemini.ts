@@ -352,9 +352,14 @@ async function parseGeminiSessionFile(
   let lastTs = usages[0].ts
   for (const [index, usage] of usages.entries()) {
     lastTs = usage.ts
+    // Gemini's thoughts (reasoning) tokens are NOT part of the output/candidates
+    // count, so fold them into tokensOutput per the billable-output convention.
+    // tokensReasoningOutput keeps the informational subset. tokensTotal already
+    // includes thoughts (see buildUsage), so it stays self-consistent.
+    const billableOutput = usage.tokensOutput + usage.tokensReasoning
     const metrics: Partial<MetricBag> = {
       tokensInput: usage.tokensInput || undefined,
-      tokensOutput: usage.tokensOutput || undefined,
+      tokensOutput: billableOutput || undefined,
       tokensCachedInput: usage.tokensCacheRead || undefined,
       tokensCacheReadInput: usage.tokensCacheRead || undefined,
       tokensReasoningOutput: usage.tokensReasoning || undefined,

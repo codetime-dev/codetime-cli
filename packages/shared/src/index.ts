@@ -3,6 +3,14 @@ import { createHash } from 'node:crypto'
 export const AGENT_TIME_API_VERSION = 'v1'
 export const AGENT_TIME_SCHEMA_VERSION = '2026-04-29'
 
+// Top-level SessionRollup schema version. Bumped to 2 when the CLI began emitting
+// trustworthy gap-clamped turn durations and the billable-output token convention
+// (tokensOutput includes reasoning tokens). The server uses this to decide how to
+// treat the data: v1 rollups still get the legacy 15-min per-turn cap applied,
+// while v2 rollups are trusted as-is. Older CLIs omit the field; the server reads
+// a missing schemaVersion as 1.
+export const AGENT_ROLLUP_SCHEMA_VERSION = 2
+
 export const KNOWN_AGENT_SOURCES = [
   'codex',
   'claude-code',
@@ -232,12 +240,22 @@ export interface MetricBag {
   modelDurationMs?: number
   toolDurationMs?: number
   commandDurationMs?: number
+  // tokensInput is cache-inclusive (it includes cached/cache-read input tokens).
   tokensInput?: number
+  // tokensOutput is the billable output total and INCLUDES reasoning tokens. For
+  // sources that report reasoning separately (Gemini thoughts, OpenCode/Codex
+  // headless reasoning_output_tokens), adapters fold reasoning into tokensOutput
+  // so downstream cost math never double-counts it.
   tokensOutput?: number
   tokensCachedInput?: number
   tokensCacheCreationInput?: number
   tokensCacheReadInput?: number
+  // tokensReasoningOutput is an informational subset of tokensOutput. It is NOT
+  // added on top of tokensOutput for billing/total purposes — it only exposes how
+  // much of the billable output was reasoning.
   tokensReasoningOutput?: number
+  // tokensTotal prefers an explicit upstream total; otherwise it is
+  // tokensInput + tokensOutput (reasoning already folded into tokensOutput).
   tokensTotal?: number
   modelContextWindow?: number
   promptChars?: number
@@ -435,6 +453,10 @@ export interface SessionTurnRollup {
 export interface SessionRollup {
   rollupKey: string
   payloadHash: string
+  // Rollup schema version (see AGENT_ROLLUP_SCHEMA_VERSION). Optional so the type
+  // still describes rollups produced by older CLIs, which omit it (server treats
+  // a missing value as 1).
+  schemaVersion?: number
   source: AgentSource
   project?: string
   sessionId: string

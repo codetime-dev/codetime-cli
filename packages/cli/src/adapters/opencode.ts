@@ -415,7 +415,7 @@ function baseOpenCodeEvent(
   }
 }
 
-function opencodeUsageFromInfo(info: Record<string, unknown>): OpenCodeUsage | undefined {
+export function opencodeUsageFromInfo(info: Record<string, unknown>): OpenCodeUsage | undefined {
   const tokensObj = objectField(info, 'tokens')
   if (!tokensObj) {
     return undefined
@@ -427,13 +427,18 @@ function opencodeUsageFromInfo(info: Record<string, unknown>): OpenCodeUsage | u
   const cacheRead = Math.max(0, numberField(cache, 'read') || 0)
   const cacheWrite = Math.max(0, numberField(cache, 'write') || 0)
   const totalInput = input + cacheRead + cacheWrite
-  const total = Math.max(0, numberField(tokensObj, 'total') || (totalInput + output + reasoning))
+  // OpenCode reports reasoning separately from output, so fold it into the
+  // billable output total. tokensReasoningOutput keeps the informational subset.
+  // The total fallback uses totalInput + billableOutput (NOT + reasoning again)
+  // to avoid double-counting; numerically equal to the previous expression.
+  const billableOutput = output + reasoning
+  const total = Math.max(0, numberField(tokensObj, 'total') || (totalInput + billableOutput))
   if (total <= 0) {
     return undefined
   }
   return {
     tokensInput: totalInput || undefined,
-    tokensOutput: output || undefined,
+    tokensOutput: billableOutput || undefined,
     tokensReasoningOutput: reasoning || undefined,
     tokensCachedInput: (cacheRead + cacheWrite) || undefined,
     tokensCacheReadInput: cacheRead || undefined,

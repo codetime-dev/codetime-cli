@@ -70,6 +70,35 @@ async function parseCodexSessionFile(
   // and inflating estimated cost.
   let lastTokenUsageKey: string | undefined
   const pendingToolCalls = new Map<string, { tool: string, startedAt: string, turnId: string | undefined }>()
+  // Per-turn last activity timestamp and turn start timestamp. When we close a
+  // turn implicitly (next user_message, or EOF fallback), turn.completed must
+  // carry that turn's OWN last activity ts — never the new prompt's ts or the
+  // global last event ts — so idle time between turns isn't counted as duration.
+  const turnLastEventAt = new Map<string, string>()
+  const turnStartedAt = new Map<string, string>()
+  // Turns already closed by an explicit task_complete. The user_message branch
+  // and the EOF fallback must not emit a second turn.completed for these.
+  const closedTurnIds = new Set<string>()
+
+  // Push an event and, when it belongs to a turn, advance that turn's last
+  // activity timestamp (and record its start the first time we see it).
+  const pushEvent = (event: CanonicalEvent, refs: Parameters<typeof withBackfillRefs>[1]): void => {
+    const turnId = event.turnId
+    if (turnId && event.ts) {
+      if (!turnStartedAt.has(turnId)) {
+        turnStartedAt.set(turnId, event.ts)
+      }
+      const prev = turnLastEventAt.get(turnId)
+      if (!prev || event.ts > prev) {
+        turnLastEventAt.set(turnId, event.ts)
+      }
+    }
+    events.push(withBackfillRefs(event, refs))
+  }
+
+  // Best-effort last activity ts for a turn (fallback: its start, then a fresh now).
+  const turnCloseTs = (turnId: string): string =>
+    turnLastEventAt.get(turnId) || turnStartedAt.get(turnId) || new Date().toISOString()
 
   for (const [index, line] of lines.entries()) {
     const lineNumber = index + 1
@@ -140,23 +169,23 @@ async function parseCodexSessionFile(
         const eventModel = parsedModel || model || 'gpt-5'
         const headlessTs = headlessCodexTimestamp(raw) || ts
         if (!sessionStartEmitted) {
-          events.push(withBackfillRefs(baseCodexEvent({
+          pushEvent(baseCodexEvent({
             ts: headlessTs,
             type: 'session.started',
             sessionId,
             model: eventModel,
             confidence: 'derived',
-          }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'session', options }))
+          }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'session', options })
           sessionStartEmitted = true
         }
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts: headlessTs,
           type: 'model.usage',
           sessionId,
           model: eventModel,
           confidence: 'partial',
           metrics: usage,
-        }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'headless', options }))
+        }), { filePath, sourcePathHash, lineNumber, topType: topType || 'result', payloadType: 'headless', options })
       }
       continue
     }
@@ -168,7 +197,7 @@ async function parseCodexSessionFile(
     switch (payloadType) {
       case 'task_started': {
         currentTurnId = stringField(payload, 'turn_id') || currentTurnId
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'turn.started',
           sessionId,
@@ -177,16 +206,22 @@ async function parseCodexSessionFile(
           project,
           model,
           confidence: 'exact',
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
       case 'user_message': {
         const message = stringField(payload, 'message') || ''
-        // Close previous turn before starting a new one
-        if (currentTurnId && currentTurnId !== turnIdAtLastUserMessage && lastTurnIdForComplete) {
-          events.push(withBackfillRefs(baseCodexEvent({
-            ts,
+        // Close previous turn before starting a new one. Use that turn's OWN last
+        // activity ts (not this prompt's ts), and skip turns already closed by an
+        // explicit task_complete so we never emit a duplicate turn.completed.
+        if (
+          currentTurnId && currentTurnId !== turnIdAtLastUserMessage
+          && lastTurnIdForComplete && !closedTurnIds.has(lastTurnIdForComplete)
+        ) {
+          closedTurnIds.add(lastTurnIdForComplete)
+          pushEvent(baseCodexEvent({
+            ts: turnCloseTs(lastTurnIdForComplete),
             type: 'turn.completed',
             sessionId,
             turnId: lastTurnIdForComplete,
@@ -194,14 +229,14 @@ async function parseCodexSessionFile(
             project,
             model,
             confidence: 'derived',
-          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
         }
         if (!currentTurnId || currentTurnId === turnIdAtLastUserMessage) {
           currentTurnId = `turn_${createStableHash([sessionId, lineNumber, ts]).slice(0, 24)}`
         }
         lastTurnIdForComplete = currentTurnId
         turnIdAtLastUserMessage = currentTurnId
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'prompt.submitted',
           sessionId,
@@ -217,7 +252,7 @@ async function parseCodexSessionFile(
           refs: stringRefs({
             promptHash: message ? `sha256:${createStableHash(message)}` : undefined,
           }),
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
@@ -242,7 +277,7 @@ async function parseCodexSessionFile(
             break
           }
           lastTokenUsageKey = usageKey
-          events.push(withBackfillRefs(baseCodexEvent({
+          pushEvent(baseCodexEvent({
             ts,
             type: 'model.usage',
             sessionId,
@@ -255,14 +290,14 @@ async function parseCodexSessionFile(
             model: rewriteCodexModelForTier(model, serviceTier),
             confidence: 'partial',
             metrics: usage,
-          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
         }
 
         break
       }
       case 'agent_message': {
         const message = stringField(payload, 'message') || ''
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'agent.operation',
           operation: 'agent message',
@@ -275,7 +310,7 @@ async function parseCodexSessionFile(
           metrics: {
             agentMessageChars: message.length,
           },
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
@@ -290,7 +325,7 @@ async function parseCodexSessionFile(
           pendingToolCalls.set(callId, { tool, startedAt: ts, turnId: currentTurnId })
         }
 
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'tool.started',
           operation: `${tool} started`,
@@ -307,9 +342,9 @@ async function parseCodexSessionFile(
           refs: stringRefs({
             sourceId: callId,
           }),
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
         if (fileActivities.length > 0) {
-          events.push(withBackfillRefs(baseCodexEvent({
+          pushEvent(baseCodexEvent({
             ts,
             type: eventTypeFromFileActivities(fileActivities),
             operation: `${tool} file activity`,
@@ -325,7 +360,7 @@ async function parseCodexSessionFile(
             refs: stringRefs({
               sourceId: callId,
             }),
-          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+          }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
         }
 
         break
@@ -339,7 +374,7 @@ async function parseCodexSessionFile(
         }
         const durationMs = pending ? durationMsBetween(pending.startedAt, ts) : undefined
 
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'tool.completed',
           operation: pending ? `${pending.tool} completed` : 'tool completed',
@@ -359,14 +394,14 @@ async function parseCodexSessionFile(
           refs: stringRefs({
             sourceId: callId,
           }),
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
       case 'exec_command_end': {
         const durationMs = durationObjectToMs(objectField(payload, 'duration'))
         const success = Number(payload.exit_code) === 0
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: success ? 'command.completed' : 'command.failed',
           operation: 'command completed',
@@ -387,7 +422,7 @@ async function parseCodexSessionFile(
             sourceId: stringField(payload, 'call_id'),
             commandHash: createStableHash(payload.command),
           }),
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
@@ -398,7 +433,7 @@ async function parseCodexSessionFile(
           cwd,
           displayFilePath,
         )
-        events.push(withBackfillRefs(baseCodexEvent({
+        pushEvent(baseCodexEvent({
           ts,
           type: 'file.changed',
           operation: 'apply patch',
@@ -415,16 +450,22 @@ async function parseCodexSessionFile(
           refs: stringRefs({
             sourceId: stringField(payload, 'call_id'),
           }),
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
       case 'task_complete': {
-        events.push(withBackfillRefs(baseCodexEvent({
+        // task_complete's own ts is correct, so leave it as-is. Record the turn as
+        // closed so the user_message / EOF fallbacks don't re-emit turn.completed.
+        const completedTurnId = stringField(payload, 'turn_id') || currentTurnId
+        if (completedTurnId) {
+          closedTurnIds.add(completedTurnId)
+        }
+        pushEvent(baseCodexEvent({
           ts,
           type: 'turn.completed',
           sessionId,
-          turnId: stringField(payload, 'turn_id') || currentTurnId,
+          turnId: completedTurnId,
           cwd,
           project,
           model,
@@ -432,7 +473,7 @@ async function parseCodexSessionFile(
           metrics: {
             durationMs: numberField(payload, 'duration_ms'),
           },
-        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options }))
+        }), { filePath, sourcePathHash, lineNumber, topType, payloadType, options })
 
         break
       }
@@ -440,11 +481,13 @@ async function parseCodexSessionFile(
     }
   }
 
-  // Close the last turn if no task_complete was emitted for it
-  if (lastTurnIdForComplete) {
-    const lastTs = events.length > 0 ? events.at(-1)!.ts : new Date().toISOString()
-    events.push(withBackfillRefs(baseCodexEvent({
-      ts: lastTs,
+  // Close the last turn if no task_complete already closed it. Use that turn's own
+  // last activity ts (not the global last event ts, which may belong to a later,
+  // separately-tracked turn).
+  if (lastTurnIdForComplete && !closedTurnIds.has(lastTurnIdForComplete)) {
+    closedTurnIds.add(lastTurnIdForComplete)
+    pushEvent(baseCodexEvent({
+      ts: turnCloseTs(lastTurnIdForComplete),
       type: 'turn.completed',
       sessionId,
       turnId: lastTurnIdForComplete,
@@ -452,7 +495,7 @@ async function parseCodexSessionFile(
       project,
       model,
       confidence: 'derived',
-    }), { filePath, sourcePathHash, lineNumber: lines.length, topType: 'event_msg', payloadType: 'turn.completed', options }))
+    }), { filePath, sourcePathHash, lineNumber: lines.length, topType: 'event_msg', payloadType: 'turn.completed', options })
   }
 
   return events.filter(event => validateCanonicalEvent(event).valid)
@@ -513,10 +556,18 @@ function headlessCodexUsage(raw: Record<string, unknown>) {
     return
   }
 
+  // Headless (codex exec) reports output_tokens EXCLUSIVE of reasoning — ccusage's
+  // total recompute (input + output + reasoning) only makes sense if reasoning is
+  // not already inside output. Fold reasoning into tokensOutput (billable-output
+  // convention); tokensReasoningOutput stays as the informational subset. The
+  // recomputed total above is unchanged: input + output + reasoning == input +
+  // (output + reasoning), so it already equals input + foldedOutput.
+  const billableOutput = output + reasoning
+
   return {
     tokensInput: input || undefined,
     tokensCachedInput: cached || undefined,
-    tokensOutput: output || undefined,
+    tokensOutput: billableOutput || undefined,
     tokensReasoningOutput: reasoning || undefined,
     tokensTotal: total,
     modelCalls: 1,

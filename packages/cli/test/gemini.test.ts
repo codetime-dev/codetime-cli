@@ -163,8 +163,10 @@ test('parity: ccusage gemini/loader loads_jsonl_token_events_and_separates_cache
   // ccusage: input_tokens=3808 (cache-exclusive) + cache_read=11526 → 15334.
   assert.equal(usages[0].metrics?.tokensInput, 3808 + 11_526)
   assert.equal(usages[0].metrics?.tokensCacheReadInput, 11_526)
-  assert.equal(usages[0].metrics?.tokensOutput, 23)
-  assert.equal(usages[0].metrics?.tokensReasoningOutput, 919) // ccusage extra_total_tokens
+  // ccusage's raw output (candidates)=23 excludes thoughts; codetime folds
+  // thoughts (919) into billable tokensOutput → 23 + 919 = 942.
+  assert.equal(usages[0].metrics?.tokensOutput, 23 + 919)
+  assert.equal(usages[0].metrics?.tokensReasoningOutput, 919) // ccusage extra_total_tokens (informational subset)
   assert.equal(usages[0].metrics?.tokensTotal, 16_276)
 })
 

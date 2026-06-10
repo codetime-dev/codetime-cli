@@ -1,11 +1,12 @@
 import type { CanonicalEvent, SessionRollup } from '@codetime/shared'
 import {
+  AGENT_ROLLUP_SCHEMA_VERSION,
   createImportKey,
   createPayloadHash,
   createStableHash,
 } from '@codetime/shared'
 import { displayBackfillPath } from '../lib/activity.js'
-import { ROLLUP_BUCKET_MS } from '../lib/constants.js'
+import { ROLLUP_BUCKET_MS, TURN_GAP_CLAMP_MS } from '../lib/constants.js'
 import { estimateEventCostUsd } from '../lib/pricing.js'
 
 export function buildSessionRollups(events: CanonicalEvent[]): SessionRollup[] {
@@ -42,6 +43,9 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
   const toolRollups = new Map<string, SessionRollup['toolRollups'][number]>()
   const fileRollups = new Map<string, SessionRollup['fileRollups'][number]>()
   const turnRollups = new Map<string, NonNullable<SessionRollup['turnRollups']>[number]>()
+  // All event timestamps observed per turn (including the turn.completed event).
+  // Used to compute a gap-clamped active duration instead of lastEventAt - startedAt.
+  const turnEventTimes = new Map<string, string[]>()
 
   let promptCount = 0
   let turnCount = 0
@@ -146,6 +150,16 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
       turnRollup.outputTokens += eventOutputTokens
       turnRollup.totalTokens += eventTotalTokens
       turnRollups.set(event.turnId, turnRollup)
+
+      // Record every event ts for this turn (turn.completed included) so the final
+      // duration can be a gap-clamped sum of active intervals.
+      const times = turnEventTimes.get(event.turnId)
+      if (times) {
+        times.push(event.ts)
+      }
+      else {
+        turnEventTimes.set(event.turnId, [event.ts])
+      }
     }
 
     inputTokens += eventInputTokens
@@ -270,6 +284,12 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
   const baseRollup: SessionRollup = {
     rollupKey,
     payloadHash: '',
+    // v2 schema: trustworthy gap-clamped turn durations + billable-output token
+    // convention. Set on baseRollup (not after) so it participates in payloadHash:
+    // every historical rollup's hash changes, and a re-backfill (uploaded with
+    // replace=true by default) cleanly refreshes all data onto the new convention.
+    // This full-refresh churn is intentional.
+    schemaVersion: AGENT_ROLLUP_SCHEMA_VERSION,
     source: first.source,
     project,
     sessionId,
@@ -298,7 +318,10 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
     turnRollups: [...turnRollups.values()]
       .map(rollup => ({
         ...rollup,
-        durationMs: Math.max(0, Date.parse(rollup.lastEventAt) - Date.parse(rollup.startedAt)),
+        // Gap-clamped active duration: startedAt/lastEventAt/completedAt keep their
+        // real timestamps, but durationMs only counts active intervals so lazy
+        // completed_at timestamps and long in-turn silences don't inflate it.
+        durationMs: gapClampedTurnDurationMs(rollup, turnEventTimes.get(rollup.turnId) || []),
       }))
       .sort((a, b) => a.startedAt.localeCompare(b.startedAt)),
   }
@@ -307,6 +330,33 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
     ...baseRollup,
     payloadHash: createPayloadHash(baseRollup),
   }
+}
+
+// Active duration of a turn: dedupe and sort all of its event timestamps (with
+// promptSubmittedAt/startedAt as the series start) and sum the gaps between
+// consecutive events, clamping each gap to TURN_GAP_CLAMP_MS. A single-event turn
+// has duration 0. This keeps long but continuously-busy turns intact while
+// discarding idle stretches and lazy completed_at timestamps.
+function gapClampedTurnDurationMs(
+  rollup: NonNullable<SessionRollup['turnRollups']>[number],
+  eventTimes: string[],
+): number {
+  const millis = [
+    rollup.promptSubmittedAt,
+    rollup.startedAt,
+    ...eventTimes,
+  ]
+    .map(ts => (ts ? Date.parse(ts) : Number.NaN))
+    .filter(ms => Number.isFinite(ms))
+  const unique = [...new Set(millis)].sort((a, b) => a - b)
+  if (unique.length < 2) {
+    return 0
+  }
+  let duration = 0
+  for (let i = 1; i < unique.length; i += 1) {
+    duration += Math.min(unique[i] - unique[i - 1], TURN_GAP_CLAMP_MS)
+  }
+  return Math.max(0, duration)
 }
 
 function floorRollupBucket(ts: string): string {
@@ -322,10 +372,12 @@ function totalTokensFromEvent(event: CanonicalEvent): number {
   if (typeof explicit === 'number' && explicit > 0) {
     return explicit
   }
+  // Billable-output convention: reasoning tokens are already folded into
+  // tokensOutput, so the fallback is input + output (adding reasoning again would
+  // double-count it).
   return (
     Math.max(0, event.metrics?.tokensInput || 0)
     + Math.max(0, event.metrics?.tokensOutput || 0)
-    + Math.max(0, event.metrics?.tokensReasoningOutput || 0)
   )
 }
 
