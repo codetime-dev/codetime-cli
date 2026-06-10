@@ -50,6 +50,40 @@ test('parity: claude usage decomposes cache and keeps tokensInput cache-inclusiv
   assert.equal(usages[0].metrics?.tokensCacheReadInput, 5)
   assert.equal(usages[0].metrics?.tokensOutput, 4)
   assert.equal(usages[0].metrics?.tokensTotal, 17 + 4)
+  // No usage.cache_creation breakdown -> TTL split is left absent.
+  assert.equal(usages[0].metrics?.tokensCacheCreation5mInput, undefined)
+  assert.equal(usages[0].metrics?.tokensCacheCreation1hInput, undefined)
+})
+
+test('claude usage splits cache creation by TTL when usage.cache_creation is present', async () => {
+  const usages = usageEvents(await parse([
+    {
+      type: 'assistant',
+      sessionId: 's1',
+      timestamp: '2026-03-29T07:00:00.000Z',
+      requestId: 'req-ttl',
+      message: {
+        id: 'msg-ttl',
+        model: 'claude-sonnet-4-20250514',
+        usage: {
+          input_tokens: 10,
+          cache_creation_input_tokens: 300,
+          cache_creation: { ephemeral_5m_input_tokens: 100, ephemeral_1h_input_tokens: 200 },
+          cache_read_input_tokens: 5,
+          output_tokens: 4,
+        },
+      },
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  // The total stays cache_creation_input_tokens; the split fills the subset fields.
+  assert.equal(usages[0].metrics?.tokensCacheCreationInput, 300)
+  assert.equal(usages[0].metrics?.tokensCacheCreation5mInput, 100)
+  assert.equal(usages[0].metrics?.tokensCacheCreation1hInput, 200)
+  // Cache-inclusive input and cached totals are unchanged by the split.
+  assert.equal(usages[0].metrics?.tokensInput, 10 + 300 + 5)
+  assert.equal(usages[0].metrics?.tokensCachedInput, 300 + 5)
 })
 
 test('parity: claude cache-only usage (from ccusage propagates_sidechain_metadata fixture)', async () => {

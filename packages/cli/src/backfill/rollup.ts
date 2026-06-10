@@ -40,6 +40,8 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
   const lastEventAt = ordered.at(-1)?.ts || startedAt
   const timeBuckets = new Map<string, SessionRollup['timeBuckets'][number]>()
   const modelRollups = new Map<string, SessionRollup['modelRollups'][number]>()
+  // Keyed by `${bucketTs}\0${model}` (v3 per-(15-min bucket, model) token buckets).
+  const modelBuckets = new Map<string, NonNullable<SessionRollup['modelBuckets']>[number]>()
   const toolRollups = new Map<string, SessionRollup['toolRollups'][number]>()
   const fileRollups = new Map<string, SessionRollup['fileRollups'][number]>()
   const turnRollups = new Map<string, NonNullable<SessionRollup['turnRollups']>[number]>()
@@ -65,6 +67,9 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
     const eventInputTokens = Math.max(0, event.metrics?.tokensInput || 0)
     const eventCachedInputTokens = Math.max(0, event.metrics?.tokensCachedInput || 0)
     const eventCacheCreationInputTokens = Math.max(0, event.metrics?.tokensCacheCreationInput || 0)
+    // TTL split subsets of cacheCreation; 0 when the agent doesn't report them.
+    const eventCacheCreation5mInputTokens = Math.max(0, event.metrics?.tokensCacheCreation5mInput || 0)
+    const eventCacheCreation1hInputTokens = Math.max(0, event.metrics?.tokensCacheCreation1hInput || 0)
     const eventCacheReadInputTokens = Math.max(0, event.metrics?.tokensCacheReadInput || 0)
     const eventOutputTokens = Math.max(0, event.metrics?.tokensOutput || 0)
     const eventReasoningOutputTokens = Math.max(0, event.metrics?.tokensReasoningOutput || 0)
@@ -197,6 +202,8 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
         inputTokens: 0,
         cachedInputTokens: 0,
         cacheCreationInputTokens: 0,
+        cacheCreation5mInputTokens: 0,
+        cacheCreation1hInputTokens: 0,
         cacheReadInputTokens: 0,
         outputTokens: 0,
         reasoningOutputTokens: 0,
@@ -207,12 +214,42 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
       modelRollup.inputTokens += eventInputTokens
       modelRollup.cachedInputTokens += eventCachedInputTokens
       modelRollup.cacheCreationInputTokens += eventCacheCreationInputTokens
+      modelRollup.cacheCreation5mInputTokens! += eventCacheCreation5mInputTokens
+      modelRollup.cacheCreation1hInputTokens! += eventCacheCreation1hInputTokens
       modelRollup.cacheReadInputTokens += eventCacheReadInputTokens
       modelRollup.outputTokens += eventOutputTokens
       modelRollup.reasoningOutputTokens += eventReasoningOutputTokens
       modelRollup.totalTokens += eventTotalTokens
       modelRollup.estimatedCostUsd += eventCostUsd
       modelRollups.set(modelKey, modelRollup)
+
+      // Per-(15-min bucket, model) token bucket (v3).
+      const modelBucketKey = `${bucketTs}\0${modelKey}`
+      const modelBucket = modelBuckets.get(modelBucketKey) || {
+        ts: bucketTs,
+        model: modelKey,
+        callCount: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        cacheCreation5mInputTokens: 0,
+        cacheCreation1hInputTokens: 0,
+        cacheReadInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 0,
+      }
+      modelBucket.callCount += 1
+      modelBucket.inputTokens += eventInputTokens
+      modelBucket.cachedInputTokens += eventCachedInputTokens
+      modelBucket.cacheCreationInputTokens += eventCacheCreationInputTokens
+      modelBucket.cacheCreation5mInputTokens += eventCacheCreation5mInputTokens
+      modelBucket.cacheCreation1hInputTokens += eventCacheCreation1hInputTokens
+      modelBucket.cacheReadInputTokens += eventCacheReadInputTokens
+      modelBucket.outputTokens += eventOutputTokens
+      modelBucket.reasoningOutputTokens += eventReasoningOutputTokens
+      modelBucket.totalTokens += eventTotalTokens
+      modelBuckets.set(modelBucketKey, modelBucket)
     }
     if (event.type === 'tool.started') {
       bucket.toolCalls += 1
@@ -284,11 +321,12 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
   const baseRollup: SessionRollup = {
     rollupKey,
     payloadHash: '',
-    // v2 schema: trustworthy gap-clamped turn durations + billable-output token
-    // convention. Set on baseRollup (not after) so it participates in payloadHash:
-    // every historical rollup's hash changes, and a re-backfill (uploaded with
-    // replace=true by default) cleanly refreshes all data onto the new convention.
-    // This full-refresh churn is intentional.
+    // v3 schema: v2 (gap-clamped turn durations + billable-output token
+    // convention) plus per-model cache-creation TTL split and modelBuckets. Set on
+    // baseRollup (not after) so it participates in payloadHash: every historical
+    // rollup's hash changes, and a re-backfill (uploaded with replace=true by
+    // default) cleanly refreshes all data onto the new convention. This
+    // full-refresh churn is intentional.
     schemaVersion: AGENT_ROLLUP_SCHEMA_VERSION,
     source: first.source,
     project,
@@ -313,6 +351,8 @@ function buildSessionRollup(rollupKey: string, events: CanonicalEvent[]): Sessio
     durationMs: Math.max(0, Date.parse(lastEventAt) - Date.parse(startedAt)),
     timeBuckets: [...timeBuckets.values()].sort((a, b) => a.ts.localeCompare(b.ts)),
     modelRollups: [...modelRollups.values()].sort((a, b) => b.callCount - a.callCount || a.model.localeCompare(b.model)),
+    // Sorted ts ascending, then model lexicographically (wire contract).
+    modelBuckets: [...modelBuckets.values()].sort((a, b) => a.ts.localeCompare(b.ts) || a.model.localeCompare(b.model)),
     toolRollups: [...toolRollups.values()].sort((a, b) => b.callCount - a.callCount || a.tool.localeCompare(b.tool)),
     fileRollups: [...fileRollups.values()].sort((a, b) => b.writes - a.writes || b.reads - a.reads || a.displayPath.localeCompare(b.displayPath)),
     turnRollups: [...turnRollups.values()]

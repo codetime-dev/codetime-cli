@@ -109,12 +109,98 @@ test('turn duration sums gap-clamped active intervals', () => {
   assert.equal(turn.lastEventAt, '2026-01-02T00:23:00.000Z')
 })
 
-test('session rollups carry the v2 schemaVersion', () => {
+test('session rollups carry the v3 schemaVersion', () => {
   const rollup = buildSessionRollups([
     turnEvent('schema-session', 'schema-turn', '2026-01-02T00:00:00.000Z', 'prompt.submitted'),
     turnEvent('schema-session', 'schema-turn', '2026-01-02T00:00:01.000Z', 'turn.completed'),
   ])[0]
-  assert.equal(rollup.schemaVersion, 2)
+  assert.equal(rollup.schemaVersion, 3)
+})
+
+// Synthetic model.usage event with a metric bag (v3 modelBuckets / TTL split).
+function modelUsageEvent(
+  ts: string,
+  model: string,
+  metrics: NonNullable<CanonicalEvent['metrics']>,
+): CanonicalEvent {
+  return {
+    schemaVersion: '2026-04-29',
+    ts,
+    type: 'model.usage',
+    source: 'claude-code',
+    agent: 'claude-code',
+    sessionId: 'bucket-session',
+    model,
+    metrics,
+    refs: { sourcePathHash: 'sha256:bucket-session' },
+  }
+}
+
+test('rollup builds modelBuckets grouped by 15-min bucket and model, with TTL split', () => {
+  // Two models across two 15-min buckets (00:00 and 00:15), with a repeated
+  // (bucket, model) pair to exercise summing.
+  const rollup = buildSessionRollups([
+    modelUsageEvent('2026-01-02T00:01:00.000Z', 'model-a', {
+      tokensInput: 10,
+      tokensCachedInput: 7,
+      tokensCacheCreationInput: 300,
+      tokensCacheCreation5mInput: 100,
+      tokensCacheCreation1hInput: 200,
+      tokensCacheReadInput: 5,
+      tokensOutput: 4,
+      tokensReasoningOutput: 1,
+      tokensTotal: 21,
+    }),
+    modelUsageEvent('2026-01-02T00:14:00.000Z', 'model-a', {
+      tokensInput: 5,
+      tokensCacheCreationInput: 50,
+      tokensCacheCreation5mInput: 50,
+      tokensCacheCreation1hInput: 0,
+      tokensOutput: 2,
+      tokensTotal: 7,
+    }),
+    modelUsageEvent('2026-01-02T00:20:00.000Z', 'model-b', {
+      tokensInput: 8,
+      tokensOutput: 3,
+      tokensTotal: 11,
+    }),
+  ])[0]
+
+  // Sorted ts ascending, then model lexicographically.
+  const buckets = rollup.modelBuckets!
+  assert.equal(buckets.length, 2)
+  assert.deepEqual(buckets.map(b => [b.ts, b.model]), [
+    ['2026-01-02T00:00:00.000Z', 'model-a'],
+    ['2026-01-02T00:15:00.000Z', 'model-b'],
+  ])
+
+  // First bucket merges both 00:00-window model-a events.
+  const [a, b] = buckets
+  assert.equal(a.callCount, 2)
+  assert.equal(a.inputTokens, 15)
+  assert.equal(a.cacheCreationInputTokens, 350)
+  assert.equal(a.cacheCreation5mInputTokens, 150)
+  assert.equal(a.cacheCreation1hInputTokens, 200)
+  assert.equal(a.cacheReadInputTokens, 5)
+  assert.equal(a.outputTokens, 6)
+  assert.equal(a.reasoningOutputTokens, 1)
+  assert.equal(a.totalTokens, 28)
+
+  // Second bucket is the single model-b event with no TTL split reported.
+  assert.equal(b.callCount, 1)
+  assert.equal(b.inputTokens, 8)
+  assert.equal(b.cacheCreation5mInputTokens, 0)
+  assert.equal(b.cacheCreation1hInputTokens, 0)
+  assert.equal(b.totalTokens, 11)
+
+  // modelRollups accumulate the TTL split across buckets.
+  const modelA = rollup.modelRollups.find(m => m.model === 'model-a')!
+  assert.equal(modelA.cacheCreationInputTokens, 350)
+  assert.equal(modelA.cacheCreation5mInputTokens, 150)
+  assert.equal(modelA.cacheCreation1hInputTokens, 200)
+  const modelB = rollup.modelRollups.find(m => m.model === 'model-b')!
+  assert.equal(modelB.cacheCreation5mInputTokens, 0)
+  assert.equal(modelB.cacheCreation1hInputTokens, 0)
 })
 
 // ── ccusage parity ──

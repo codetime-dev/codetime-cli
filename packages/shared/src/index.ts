@@ -9,7 +9,9 @@ export const AGENT_TIME_SCHEMA_VERSION = '2026-04-29'
 // treat the data: v1 rollups still get the legacy 15-min per-turn cap applied,
 // while v2 rollups are trusted as-is. Older CLIs omit the field; the server reads
 // a missing schemaVersion as 1.
-export const AGENT_ROLLUP_SCHEMA_VERSION = 2
+// v3 = v2 + per-model cache-creation TTL split (cacheCreation5m/1hInputTokens on
+// modelRollups) + modelBuckets (15-min aligned per-model token buckets).
+export const AGENT_ROLLUP_SCHEMA_VERSION = 3
 
 export const KNOWN_AGENT_SOURCES = [
   'codex',
@@ -249,6 +251,11 @@ export interface MetricBag {
   tokensOutput?: number
   tokensCachedInput?: number
   tokensCacheCreationInput?: number
+  // tokensCacheCreation5mInput / tokensCacheCreation1hInput are subsets of
+  // tokensCacheCreationInput split by cache write TTL. Absent when the agent
+  // doesn't report the TTL split (only Anthropic surfaces usage.cache_creation).
+  tokensCacheCreation5mInput?: number
+  tokensCacheCreation1hInput?: number
   tokensCacheReadInput?: number
   // tokensReasoningOutput is an informational subset of tokensOutput. It is NOT
   // added on top of tokensOutput for billing/total purposes — it only exposes how
@@ -411,11 +418,33 @@ export interface SessionModelRollup {
   inputTokens: number
   cachedInputTokens: number
   cacheCreationInputTokens: number
+  // 5-minute-TTL cache writes (subset of cacheCreationInputTokens).
+  cacheCreation5mInputTokens?: number
+  // 1-hour-TTL cache writes (subset of cacheCreationInputTokens).
+  cacheCreation1hInputTokens?: number
   cacheReadInputTokens: number
   outputTokens: number
   reasoningOutputTokens: number
   totalTokens: number
   estimatedCostUsd: number
+}
+
+// Per-(15-min bucket, model) token aggregation. The ts field uses the same
+// 15-min alignment (floorRollupBucket) as SessionTimeBucketRollup. Added in v3
+// so the server can attribute cache-creation TTL splits per model over time.
+export interface SessionModelBucketRollup {
+  ts: string
+  model: string
+  callCount: number
+  inputTokens: number
+  cachedInputTokens: number
+  cacheCreationInputTokens: number
+  cacheCreation5mInputTokens: number
+  cacheCreation1hInputTokens: number
+  cacheReadInputTokens: number
+  outputTokens: number
+  reasoningOutputTokens: number
+  totalTokens: number
 }
 
 export interface SessionToolRollup {
@@ -480,6 +509,9 @@ export interface SessionRollup {
   durationMs: number
   timeBuckets: SessionTimeBucketRollup[]
   modelRollups: SessionModelRollup[]
+  // 15-min aligned per-model token buckets (v3). Optional so the type still
+  // describes rollups produced by older CLIs, which omit it.
+  modelBuckets?: SessionModelBucketRollup[]
   toolRollups: SessionToolRollup[]
   fileRollups: SessionFileRollup[]
   turnRollups?: SessionTurnRollup[]

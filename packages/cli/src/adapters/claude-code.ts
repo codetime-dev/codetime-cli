@@ -378,15 +378,40 @@ export function claudeUsageFromMessage(message: Record<string, unknown>): Partia
   const outputTokens = numberField(usage, 'output_tokens') || 0
   const cachedInputTokens = cacheCreationInputTokens + cacheReadInputTokens
   const totalInputTokens = inputTokens + cachedInputTokens
+  const cacheCreationSplit = claudeCacheCreationSplit(usage)
 
   return {
     tokensInput: totalInputTokens || undefined,
     tokensCachedInput: cachedInputTokens || undefined,
     tokensCacheCreationInput: cacheCreationInputTokens || undefined,
+    tokensCacheCreation5mInput: cacheCreationSplit?.fiveMinute,
+    tokensCacheCreation1hInput: cacheCreationSplit?.oneHour,
     tokensCacheReadInput: cacheReadInputTokens || undefined,
     tokensOutput: outputTokens || undefined,
     tokensTotal: totalInputTokens + outputTokens || undefined,
     modelCalls: 1,
+  }
+}
+
+// Splits Anthropic's `cache_creation_input_tokens` total into 5m/1h TTL buckets
+// using the optional `usage.cache_creation: { ephemeral_5m_input_tokens,
+// ephemeral_1h_input_tokens }` breakdown. The split matters for cost: ccusage
+// (rust/crates/ccusage/src/cost.rs) prices the 5m portion at the cache_create
+// rate (~1.25x input) but the 1h portion at input * CACHE_CREATE_1H_INPUT_MULTIPLIER
+// (= 2.0), so collapsing them underestimates 1h writes by ~60%.
+//
+// Fault tolerance mirrors ccusage: the explicit ephemeral fields are trusted as
+// the per-TTL split (defaulting to 0), while the total stays
+// cache_creation_input_tokens. We only emit the split when the breakdown object
+// is present; otherwise the TTL split is unknown and left absent.
+function claudeCacheCreationSplit(usage: Record<string, unknown>): { fiveMinute: number, oneHour: number } | undefined {
+  const breakdown = usage.cache_creation
+  if (!isPlainObject(breakdown)) {
+    return undefined
+  }
+  return {
+    fiveMinute: numberField(breakdown, 'ephemeral_5m_input_tokens') || 0,
+    oneHour: numberField(breakdown, 'ephemeral_1h_input_tokens') || 0,
   }
 }
 
@@ -401,6 +426,7 @@ function claudeSubagentMetrics(
   const outputTokens = numberField(usage, 'output_tokens') || 0
   const cachedInputTokens = cacheCreationInputTokens + cacheReadInputTokens
   const totalInputTokens = inputTokens + cachedInputTokens
+  const cacheCreationSplit = claudeCacheCreationSplit(usage)
   const durationMs = numberField(toolResult, 'totalDurationMs') || fallbackDurationMs
 
   return {
@@ -410,6 +436,8 @@ function claudeSubagentMetrics(
     tokensInput: totalInputTokens || undefined,
     tokensCachedInput: cachedInputTokens || undefined,
     tokensCacheCreationInput: cacheCreationInputTokens || undefined,
+    tokensCacheCreation5mInput: cacheCreationSplit?.fiveMinute,
+    tokensCacheCreation1hInput: cacheCreationSplit?.oneHour,
     tokensCacheReadInput: cacheReadInputTokens || undefined,
     tokensOutput: outputTokens || undefined,
     tokensTotal: numberField(toolResult, 'totalTokens') || totalInputTokens + outputTokens || undefined,
