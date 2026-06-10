@@ -1,3 +1,11 @@
+## v0.6.0
+
+[v0.5.0...v0.6.0](https://github.com/codetime-dev/codetime-cli/compare/v0.5.0...v0.6.0)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: exclude idle time from turn durations and unify reasoning token accounting - By [Jianqi Pan](mailto:jannchie@gmail.com) in [de7e3be](https://github.com/codetime-dev/codetime-cli/commit/de7e3be)
+
 ## v0.5.0
 
 [v0.4.0...v0.5.0](https://github.com/codetime-dev/codetime-cli/compare/v0.4.0...v0.5.0)
