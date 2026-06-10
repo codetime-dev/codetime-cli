@@ -1,3 +1,11 @@
+## v0.7.0
+
+[v0.6.0...v0.7.0](https://github.com/codetime-dev/codetime-cli/compare/v0.6.0...v0.7.0)
+
+### :sparkles: Features
+
+- **cli**: split cache-creation TTL and ship per-model time buckets (rollup v3) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [859686a](https://github.com/codetime-dev/codetime-cli/commit/859686a)
+
 ## v0.6.0
 
 [v0.5.0...v0.6.0](https://github.com/codetime-dev/codetime-cli/compare/v0.5.0...v0.6.0)
