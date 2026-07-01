@@ -8,7 +8,7 @@ import type {
 import type { BackfillSourceDefinition } from './lib/backfill.js'
 import type { BackfillImportCounts, BackfillIncrementalState, BackfillSourceFile, ParsedArgs, RunContext, SyncLocalLock, SyncLocalTriggerState, WritableLike } from './lib/types.js'
 import { spawn } from 'node:child_process'
-import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -33,7 +33,7 @@ import { matchesBackfillFilters } from './lib/backfill.js'
 import { defaultMachineName, ensureLocalMachineId, readConfig, writeConfig } from './lib/config.js'
 import { DEFAULT_API_URL, DEFAULT_BACKFILL_BATCH_BYTES, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_HOOK_SYNC_MIN_INTERVAL_SECONDS, PACKAGE_VERSION } from './lib/constants.js'
 import { isPlainObject, numberOption, stringOption, valuesOption } from './lib/fields.js'
-import { countDirectoryEntries, listJsonlFiles, pathExists, readJsonIfExists } from './lib/fs.js'
+import { countDirectoryEntries, listJsonlFiles, pathExists, readJsonIfExistsTolerant, writeFileAtomic } from './lib/fs.js'
 import { logError } from './lib/logger.js'
 import { isHeadless, openBrowser, sleep } from './lib/login.js'
 import { ProgressBar } from './lib/progress.js'
@@ -1085,11 +1085,12 @@ function syncLocalTriggerLockPath(home: string): string {
 }
 
 async function readBackfillIncrementalState(home: string, ctx?: RunContext): Promise<BackfillIncrementalState> {
-  // Corrupt JSON now surfaces from readJsonIfExists; a missing file
-  // resolves to null. Anything else (wrong shape, mismatched schema
-  // version, manual edits that dropped `sources`) lands here and would
-  // previously vanish silently — log via debug so the user can see
-  // when watermarks were dropped.
+  // Corrupt/torn JSON is now tolerated: readJsonIfExistsTolerant returns
+  // null (a missing file also resolves to null), so a state file torn by a
+  // concurrent writer self-heals to defaults instead of bricking sync. The
+  // onCorrupt hook logs the swallow so the resulting full re-import is
+  // diagnosable. Anything else (wrong shape, mismatched schema version,
+  // manual edits that dropped `sources`) lands below and is logged via debug.
   //
   // When the on-disk schema version doesn't match the CLI's current
   // BACKFILL_STATE_SCHEMA_VERSION we deliberately drop every watermark.
@@ -1098,7 +1099,12 @@ async function readBackfillIncrementalState(home: string, ctx?: RunContext): Pro
   // changed parser semantics (e.g. v2's dedup fix) silently rewrites
   // historical rollups without the user knowing.
   const statePath = backfillIncrementalStatePath(home)
-  const state = await readJsonIfExists(statePath)
+  const state = await readJsonIfExistsTolerant(
+    statePath,
+    ctx
+      ? error => debug(ctx, `backfill-state unreadable at ${statePath}; dropping watermarks and re-importing (${error.message})\n`)
+      : undefined,
+  )
   if (state === null) {
     return { version: BACKFILL_STATE_SCHEMA_VERSION, sources: {} }
   }
@@ -1140,12 +1146,11 @@ async function updateBackfillIncrementalState(
   }
 
   const statePath = backfillIncrementalStatePath(home)
-  await mkdir(path.dirname(statePath), { recursive: true })
-  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  await writeFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`)
 }
 
 async function readSyncLocalTriggerState(statePath: string): Promise<SyncLocalTriggerState> {
-  const state = await readJsonIfExists(statePath)
+  const state = await readJsonIfExistsTolerant(statePath)
   if (!isPlainObject(state)) {
     return { version: 1 }
   }
@@ -1169,12 +1174,11 @@ async function readSyncLocalTriggerState(statePath: string): Promise<SyncLocalTr
 }
 
 async function writeSyncLocalTriggerState(statePath: string, state: SyncLocalTriggerState): Promise<void> {
-  await mkdir(path.dirname(statePath), { recursive: true })
-  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  await writeFileAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`)
 }
 
 async function readSyncLocalLock(lockPath: string): Promise<SyncLocalLock | undefined> {
-  const lock = await readJsonIfExists(lockPath)
+  const lock = await readJsonIfExistsTolerant(lockPath)
   if (!isPlainObject(lock)) {
     return undefined
   }
@@ -1185,8 +1189,7 @@ async function readSyncLocalLock(lockPath: string): Promise<SyncLocalLock | unde
 }
 
 async function writeSyncLocalLock(lockPath: string, lock: SyncLocalLock): Promise<void> {
-  await mkdir(path.dirname(lockPath), { recursive: true })
-  await writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`, 'utf8')
+  await writeFileAtomic(lockPath, `${JSON.stringify(lock, null, 2)}\n`)
 }
 
 async function clearSyncLocalLock(lockPath: string): Promise<void> {

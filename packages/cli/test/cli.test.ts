@@ -1,6 +1,6 @@
 import type { RunContext } from '../src/lib/types.ts'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -8,6 +8,8 @@ import { Readable } from 'node:stream'
 import { test } from 'node:test'
 import { createCodexAdapter } from '../src/adapters/codex.ts'
 import { run, syncLocalRunnerEntryArgs } from '../src/cli.ts'
+import { ensureLocalMachineId, machineIdPath, readConfig, writeConfig } from '../src/lib/config.ts'
+import { writeFileAtomic } from '../src/lib/fs.ts'
 
 test('detect reports installed Codex hook', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
@@ -1611,4 +1613,220 @@ test('sync --dry-run plans without uploading', async () => {
 
   assert.equal(exitCode, 0)
   assert.equal(calls.length, 0)
+})
+
+// ── Corruption resilience: atomic writes + self-healing reads ──
+//
+// Regression tests for the torn sync-local-trigger.json class: two CLI
+// processes wrote a .codetime/*.json non-atomically and a later read threw
+// "Could not parse JSON file", bricking sync until the user rm-ed the file.
+// Writes are now atomic (temp + rename) and the disposable-cache reads
+// tolerate corruption by resetting to defaults.
+
+function tornTriggerState(): string {
+  // A complete object followed by the tail of a longer prior write — exactly
+  // the shape a real user reported after two runners raced on the file.
+  return `${JSON.stringify({ version: 1, lastStartedAt: '2026-06-30T11:32:13.965Z', pid: 88_431 }, null, 2)}\nt": "2026-06-30T11:32:13.964Z",\n  "pid": 88428\n}\n`
+}
+
+test('hook self-heals a torn sync-local-trigger.json instead of dropping the sync', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await mkdir(path.join(home, '.codetime'), { recursive: true })
+  await writeFile(path.join(home, '.codetime', 'sync-local-trigger.json'), tornTriggerState(), 'utf8')
+  const spawns: Array<{ args: string[] }> = []
+  const stdin = Readable.from([JSON.stringify({
+    hook_event_name: 'PostToolUse',
+    tool_name: 'apply_patch',
+    cwd: path.join(home, 'project'),
+    session_id: 's1',
+  })])
+
+  const exitCode = await run(['hook', '--agent', 'codex', '--home', home], testContext({
+    stdin,
+    spawn: ((_command: string, args: string[]) => {
+      spawns.push({ args })
+      return { pid: 43_210, unref() {} } as never
+    }) as unknown as RunContext['spawn'],
+  }))
+
+  assert.equal(exitCode, 0)
+  // Before the fix the torn read threw, the hook swallowed it, and the runner
+  // never spawned — sync silently died. It must still trigger.
+  assert.equal(spawns.length, 1)
+  assert.equal(spawns[0].args.includes('sync-local-runner'), true)
+  const rewritten = JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.json'), 'utf8'))
+  assert.equal(typeof rewritten.lastTriggeredAt, 'string')
+})
+
+test('sync-local-trigger recovers from a torn state file', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await mkdir(path.join(home, '.codetime'), { recursive: true })
+  await writeFile(path.join(home, '.codetime', 'sync-local-trigger.json'), tornTriggerState(), 'utf8')
+  const spawns: number[] = []
+  let errorText = ''
+
+  const exitCode = await run(['sync-local-trigger', '--home', home, '--json'], testContext({
+    stderr: { write: (text: string) => {
+      errorText += text
+    } },
+    spawn: (() => {
+      spawns.push(1)
+      return { pid: 51_000, unref() {} }
+    }) as unknown as RunContext['spawn'],
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(errorText.includes('Could not parse JSON file'), false)
+  assert.equal(spawns.length, 1)
+  // The successful trigger rewrites the file, so it parses cleanly again.
+  const rewritten = JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.json'), 'utf8'))
+  assert.equal(typeof rewritten.lastTriggeredAt, 'string')
+})
+
+test('sync-local-trigger recovers from a torn lock file', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await mkdir(path.join(home, '.codetime'), { recursive: true })
+  // Truncated mid-write: a valid JSON prefix with no closing brace.
+  await writeFile(path.join(home, '.codetime', 'sync-local-trigger.lock'), '{"pid":123,"startedAt":"2026-', 'utf8')
+  const spawns: number[] = []
+  let errorText = ''
+
+  const exitCode = await run(['sync-local-trigger', '--home', home, '--json'], testContext({
+    stderr: { write: (text: string) => {
+      errorText += text
+    } },
+    spawn: (() => {
+      spawns.push(1)
+      return { pid: 52_000, unref() {} }
+    }) as unknown as RunContext['spawn'],
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(errorText.includes('Could not parse JSON file'), false)
+  // A torn lock is treated as "no lock", so the trigger proceeds and self-heals.
+  assert.equal(spawns.length, 1)
+  const lock = JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.lock'), 'utf8'))
+  assert.equal(lock.pid, 52_000)
+})
+
+test('backfill import self-heals a torn backfill-state.json', async () => {
+  const home = await createCodexBackfillHome()
+  await mkdir(path.join(home, '.codetime'), { recursive: true })
+  await writeFile(path.join(home, '.codetime', 'backfill-state.json'), '{"version":4,"sources":{"codex":{"waterm', 'utf8')
+  let errorText = ''
+
+  const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test'], testContext({
+    stderr: { write: (text: string) => {
+      errorText += text
+    } },
+    fetch: async (_url, init) => {
+      const rollups = JSON.parse(String(init?.body)).rollups
+      return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
+    },
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(errorText.includes('Could not parse JSON file'), false)
+  const rewritten = JSON.parse(await readFile(path.join(home, '.codetime', 'backfill-state.json'), 'utf8'))
+  assert.equal(typeof rewritten.version, 'number')
+  assert.equal(typeof rewritten.sources, 'object')
+})
+
+test('sync-local-trigger leaves no temp files and writes valid JSON', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+
+  const exitCode = await run(['sync-local-trigger', '--home', home, '--json'], testContext({
+    spawn: (() => ({ pid: 53_000, unref() {} })) as unknown as RunContext['spawn'],
+  }))
+
+  assert.equal(exitCode, 0)
+  const entries = await readdir(path.join(home, '.codetime'))
+  assert.equal(entries.some(name => name.endsWith('.tmp')), false, 'atomic write must not leak temp files')
+  JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.json'), 'utf8'))
+  JSON.parse(await readFile(path.join(home, '.codetime', 'sync-local-trigger.lock'), 'utf8'))
+})
+
+test('writeFileAtomic writes atomically without leaking temp files', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const target = path.join(home, 'nested', 'state.json')
+
+  await writeFileAtomic(target, `${JSON.stringify({ a: 1 }, null, 2)}\n`)
+
+  assert.deepEqual(JSON.parse(await readFile(target, 'utf8')), { a: 1 })
+  const entries = await readdir(path.join(home, 'nested'))
+  assert.equal(entries.some(name => name.endsWith('.tmp')), false)
+})
+
+test('writeFileAtomic honors an explicit mode', async () => {
+  if (process.platform === 'win32') {
+    return // Windows ignores POSIX mode bits.
+  }
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const target = path.join(home, 'secret.json')
+
+  await writeFileAtomic(target, '{}\n', { mode: 0o600 })
+
+  const info = await stat(target)
+  assert.equal(info.mode & 0o777, 0o600)
+})
+
+test('writeFileAtomic never leaves a torn file under concurrent writers', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const target = path.join(home, 'contended.json')
+  // Distinct, different-length payloads so a torn interleave would be visible.
+  const writers = Array.from({ length: 40 }, (_value, i) =>
+    writeFileAtomic(target, `${JSON.stringify({ i, pad: 'x'.repeat(i * 7) })}\n`))
+
+  await Promise.all(writers)
+
+  const parsed = JSON.parse(await readFile(target, 'utf8')) // one complete winner, never torn
+  assert.equal(typeof parsed.i, 'number')
+  const entries = await readdir(home)
+  assert.equal(entries.some(name => name.endsWith('.tmp')), false)
+})
+
+test('writeConfig round-trips atomically at mode 0600', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+
+  writeConfig({ token: 't', remoteUrl: 'http://example.test' }, home)
+
+  assert.deepEqual(readConfig(home), { token: 't', remoteUrl: 'http://example.test' })
+  const entries = await readdir(path.join(home, '.codetime'))
+  assert.equal(entries.some(name => name.endsWith('.tmp')), false)
+  if (process.platform !== 'win32') {
+    const info = await stat(path.join(home, '.codetime', 'config.json'))
+    assert.equal(info.mode & 0o777, 0o600)
+  }
+})
+
+test('ensureLocalMachineId is idempotent and preserves a legacy id', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const first = ensureLocalMachineId(home)
+  const second = ensureLocalMachineId(home)
+  assert.equal(first, second)
+  assert.equal(first.length > 0, true)
+
+  const legacyHome = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  await mkdir(path.join(legacyHome, '.codetime'), { recursive: true })
+  await writeFile(machineIdPath(legacyHome), 'legacy-id-123\n', 'utf8')
+  assert.equal(ensureLocalMachineId(legacyHome), 'legacy-id-123')
+})
+
+test('ensureLocalMachineId heals an empty or whitespace machine-id file', async () => {
+  // A 0-byte/whitespace machine-id can come from an interrupted legacy write or
+  // manual truncation. It must heal to a single stable id, not churn a fresh
+  // (never-persisted) uuid on every call.
+  for (const seed of ['', '  \n']) {
+    const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+    await mkdir(path.join(home, '.codetime'), { recursive: true })
+    await writeFile(machineIdPath(home), seed, 'utf8')
+
+    const first = ensureLocalMachineId(home)
+    const second = ensureLocalMachineId(home)
+
+    assert.equal(first.length > 0, true)
+    assert.equal(first, second, 'must be idempotent, not churn ids')
+    const onDisk = await readFile(machineIdPath(home), 'utf8')
+    assert.equal(onDisk.trim(), first, 'healed id must be persisted')
+  }
 })
