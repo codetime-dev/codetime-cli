@@ -1,3 +1,11 @@
+## v0.7.1
+
+[v0.7.0...v0.7.1](https://github.com/codetime-dev/codetime-cli/compare/v0.7.0...v0.7.1)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: prevent torn .codetime state files from bricking sync - By [Jianqi Pan](mailto:jannchie@gmail.com) in [60b6e06](https://github.com/codetime-dev/codetime-cli/commit/60b6e06)
+
 ## v0.7.0
 
 [v0.6.0...v0.7.0](https://github.com/codetime-dev/codetime-cli/compare/v0.6.0...v0.7.0)
