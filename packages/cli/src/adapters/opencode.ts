@@ -185,7 +185,16 @@ async function parseOpenCodeSessionFile(
           const tokens = opencodeUsageFromInfo(info)
           const cost = (typeof info.cost === 'number' && info.cost > 0) ? info.cost as number : undefined
 
+          // The assistant message's own info.tokens is the authoritative per-message
+          // usage (this is the only thing ccusage counts — it reads `SELECT ... FROM
+          // message` and never the part table). Each `step-finish` part ALSO carries a
+          // tokens object that repeats those same tokens, so emitting model.usage for
+          // both double-counted the turn (≥2× for a single-step message). Only fall
+          // back to step-finish tokens when the message carried none of its own.
+          let messageHadUsage = false
+
           if (tokens) {
+            messageHadUsage = true
             const metrics: MetricBag = {
               tokensInput: tokens.tokensInput,
               tokensOutput: tokens.tokensOutput,
@@ -315,7 +324,7 @@ async function parseOpenCodeSessionFile(
                 }
               }
 
-              if (pd.type === 'step-finish') {
+              if (pd.type === 'step-finish' && !messageHadUsage) {
                 const stepTokens = opencodeUsageFromInfo(pd)
                 const stepCost = (typeof pd.cost === 'number' && pd.cost > 0) ? pd.cost as number : undefined
                 if (stepTokens) {
