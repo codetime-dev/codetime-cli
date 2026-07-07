@@ -225,7 +225,13 @@ async function parseClaudeCodeSessionFile(
       continue
     }
 
-    model = stringField(message, 'model') || model
+    // Claude Code stamps injected/synthetic assistant turns with model
+    // "<synthetic>"; ccusage strips it so those tokens don't create a bogus
+    // per-model bucket. Ignore it here too (keep the real running model).
+    const parsedModel = stringField(message, 'model')
+    if (parsedModel && parsedModel !== '<synthetic>') {
+      model = parsedModel
+    }
     // Skip the entire assistant entry when (messageId, requestId) was
     // already processed — applies to both the usage metrics and any
     // tool_use items so we don't double-emit tool.started either.

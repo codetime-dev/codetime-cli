@@ -323,7 +323,16 @@ export function piUsageFromMessage(message: Record<string, unknown>): Partial<Me
   const output = numberField(usage, 'output') || 0
   const cacheRead = numberField(usage, 'cacheRead') || 0
   const cacheWrite = numberField(usage, 'cacheWrite') || 0
-  const totalTokens = numberField(usage, 'totalTokens') || (input + output + cacheRead + cacheWrite)
+  // ccusage apply_total_token_fallback: an explicit totalTokens can only ADD tokens
+  // the parts don't account for (folded into billable output), never shrink the
+  // parts sum. This both counts total-only records (output would otherwise be 0)
+  // and stops an explicit total smaller than the parts from undercounting the grand
+  // total.
+  const explicitTotal = numberField(usage, 'totalTokens') || 0
+  const partsSum = input + output + cacheRead + cacheWrite
+  const missing = Math.max(0, explicitTotal - partsSum)
+  const billableOutput = output + missing
+  const totalTokens = partsSum + missing
 
   if (totalTokens <= 0) {
     return undefined
@@ -334,7 +343,7 @@ export function piUsageFromMessage(message: Record<string, unknown>): Partial<Me
 
   return {
     tokensInput: (input + cacheRead + cacheWrite) || undefined,
-    tokensOutput: output || undefined,
+    tokensOutput: billableOutput || undefined,
     tokensCachedInput: (cacheRead + cacheWrite) || undefined,
     tokensCacheReadInput: cacheRead || undefined,
     tokensCacheCreationInput: cacheWrite || undefined,

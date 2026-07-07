@@ -48,6 +48,22 @@ test('parses JSONL direct events and keeps tokensInput cache-inclusive', async (
   assert.equal(usages[1].metrics?.tokensTotal, 240)
 })
 
+test('empty-string ids are not a dedup key; distinct events are kept', async () => {
+  // stringField returns '' verbatim; treating it as a real id collapsed distinct
+  // events (last-write-wins). ccusage non_empty_string maps '' -> None -> no dedup.
+  const dir = await mkdtemp(path.join(tmpdir(), 'gemini-'))
+  const file = path.join(dir, 'session.jsonl')
+  await writeLines(file, [
+    { type: 'gemini', model: 'g', id: '', timestamp: '2026-04-29T00:00:01.000Z', tokens: { input: 10, output: 5 } },
+    { type: 'gemini', model: 'g', id: '  ', timestamp: '2026-04-29T00:00:02.000Z', tokens: { input: 999, output: 5 } },
+  ])
+
+  const usages = usageEvents(await parse(file))
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 10)
+  assert.equal(usages[1].metrics?.tokensInput, 999)
+})
+
 test('brackets usage events with session.started and session.ended', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'gemini-'))
   const file = path.join(dir, 'session.jsonl')

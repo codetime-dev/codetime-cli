@@ -6,6 +6,14 @@ export function stringField(object: unknown, key: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+// Like stringField but treats empty / whitespace-only strings as absent, mirroring
+// ccusage's non_empty_string (trim -> None). Returns the original (untrimmed) value
+// when non-empty, so it composes with `??` fallbacks and dedup-key checks.
+export function nonEmptyStringField(object: unknown, key: string): string | undefined {
+  const value = stringField(object, key)
+  return value && value.trim().length > 0 ? value : undefined
+}
+
 export function numberField(object: Record<string, unknown>, key: string): number | undefined {
   const value = object[key]
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined

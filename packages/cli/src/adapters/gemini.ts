@@ -10,6 +10,7 @@ import { matchesBackfillFilters } from '../lib/backfill.js'
 import {
   arrayField,
   isPlainObject,
+  nonEmptyStringField,
   numberField,
   objectField,
   stringField,
@@ -223,16 +224,19 @@ function parseJsonRecord(
   fileStem: string,
   fallbackTs: string,
 ): ParsedFile {
-  const sessionId = stringField(record, 'sessionId')
-    ?? stringField(record, 'session_id')
+  const sessionId = nonEmptyStringField(record, 'sessionId')
+    ?? nonEmptyStringField(record, 'session_id')
     ?? fileStem
   const sessionTs = timestampFrom(stringField(record, 'startTime'))
     ?? timestampFrom(stringField(record, 'lastUpdated'))
     ?? fallbackTs
 
-  const messages = arrayField(record, 'messages').filter(isPlainObject)
-  if (messages.length > 0) {
-    const usages = messages
+  // A `messages` array — even an empty one — marks this as a session-file record;
+  // ccusage returns its (possibly empty) messages and never falls through to the
+  // top-level type/stats branches, so neither do we.
+  if (Array.isArray(record.messages)) {
+    const usages = arrayField(record, 'messages')
+      .filter(isPlainObject)
       .filter(message => stringField(message, 'type') === 'gemini')
       .map(message => parseDirectEvent(message, undefined, sessionTs))
       .filter((usage): usage is GeminiUsage => usage !== undefined)
@@ -268,7 +272,7 @@ function parseJsonlRecords(
     if (!record) {
       continue
     }
-    const sid = stringField(record, 'sessionId') ?? stringField(record, 'session_id')
+    const sid = nonEmptyStringField(record, 'sessionId') ?? nonEmptyStringField(record, 'session_id')
     if (sid) {
       sessionId = sid
     }
@@ -282,7 +286,9 @@ function parseJsonlRecords(
       if (!usage) {
         continue
       }
-      const id = stringField(record, 'id')
+      // An empty / whitespace id is not a real dedup key (ccusage non_empty_string
+      // -> None); push those verbatim instead of collapsing distinct events.
+      const id = nonEmptyStringField(record, 'id')
       if (id === undefined) {
         usages.push(usage)
       }
