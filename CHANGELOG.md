@@ -1,3 +1,14 @@
+## v0.7.3
+
+[v0.7.2...v0.7.3](https://github.com/codetime-dev/codetime-cli/compare/v0.7.2...v0.7.3)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: stop double-counting OpenCode step-finish token usage - By [Jianqi Pan](mailto:jannchie@gmail.com) in [e2ddc15](https://github.com/codetime-dev/codetime-cli/commit/e2ddc15)
+- **cli**: recover Amp usage from tokens.total and ledger-less threads - By [Jianqi Pan](mailto:jannchie@gmail.com) in [67c72ef](https://github.com/codetime-dev/codetime-cli/commit/67c72ef)
+- **cli**: count Codex cumulative-only token_count events and clamp cached input - By [Jianqi Pan](mailto:jannchie@gmail.com) in [d39e9f1](https://github.com/codetime-dev/codetime-cli/commit/d39e9f1)
+- **cli**: align pi/gemini/claude-code token edge cases with ccusage - By [Jianqi Pan](mailto:jannchie@gmail.com) in [a95cbad](https://github.com/codetime-dev/codetime-cli/commit/a95cbad)
+
 ## v0.7.2
 
 [v0.7.1...v0.7.2](https://github.com/codetime-dev/codetime-cli/compare/v0.7.1...v0.7.2)
