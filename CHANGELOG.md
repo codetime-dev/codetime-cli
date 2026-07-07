@@ -1,3 +1,12 @@
+## v0.7.4
+
+[v0.7.3...v0.7.4](https://github.com/codetime-dev/codetime-cli/compare/v0.7.3...v0.7.4)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: make backfill resilient to local session-file rotation (non-destructive `--force`, opt-in `--purge`, Codex `archived_sessions` import) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [b43fb61](https://github.com/codetime-dev/codetime-cli/commit/b43fb61)
+- **cli**: bump backfill state schema to v5 so parity + rotation fixes re-apply to history - By [Jianqi Pan](mailto:jannchie@gmail.com) in [e906427](https://github.com/codetime-dev/codetime-cli/commit/e906427)
+
 ## v0.7.3
 
 [v0.7.2...v0.7.3](https://github.com/codetime-dev/codetime-cli/compare/v0.7.2...v0.7.3)

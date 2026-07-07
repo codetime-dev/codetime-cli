@@ -1,7 +1,7 @@
 {
   "name": "codetime-cli",
   "type": "module",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "codetime CLI — install AI-agent hooks (Claude Code, Codex, OpenCode, Pi) and report activity to codetime.dev.",
   "license": "MIT",
   "publishConfig": {
