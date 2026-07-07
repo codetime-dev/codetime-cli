@@ -330,3 +330,57 @@ test('parity: ccusage codex uses nested model_name for standalone exec usage', a
   assert.equal(usages[0].metrics?.tokensOutput, 5)
   assert.equal(usages[0].metrics?.tokensTotal, 15)
 })
+
+// ── forked subagent replay (parent token history re-stamped at creation second) ──
+
+test('parity: ccusage codex skips replayed parent token history in thread_spawn subagent files', async () => {
+  // From ccusage loader.rs skips_replayed_parent_token_history_in_thread_spawn_subagent_files.
+  // The subagent file opens with its own session_meta (thread_spawn), the parent's
+  // session_meta, then the parent's token history replayed at the creation second
+  // (08:03:00), then the subagent's own usage at later seconds. Only the latter counts.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'subagent-abc', source: { subagent: { thread_spawn: { parent_thread_id: 'parent-xyz' } } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'parent-xyz' } },
+    // replayed parent history — all stamped at the subagent creation second
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200, total_tokens: 1200 }, total_token_usage: { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200, total_tokens: 1200 } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 500, cached_input_tokens: 50, output_tokens: 100, total_tokens: 600 }, total_token_usage: { input_tokens: 1500, cached_input_tokens: 150, output_tokens: 300, total_tokens: 1800 } } } },
+    // subagent's own entries — later seconds
+    { timestamp: '2026-05-12T08:04:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.2', last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 120 } } } },
+    { timestamp: '2026-05-12T08:05:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 50, cached_input_tokens: 5, output_tokens: 10, total_tokens: 60 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[0].metrics?.tokensCachedInput, 10)
+  assert.equal(usages[0].metrics?.tokensOutput, 20)
+  assert.equal(usages[1].metrics?.tokensInput, 50)
+  assert.equal(usages[1].metrics?.tokensOutput, 10)
+})
+
+test('a non-subagent file whose first two token_counts share a second is NOT skipped', async () => {
+  // No thread_spawn marker → the same-second heuristic must not fire, so two
+  // genuinely distinct turns that happen to land in the same wall-clock second
+  // are both kept. Guards against over-eager replay skipping on normal sessions.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-12T08:03:00.100Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-05-12T08:03:00.200Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 130 } } } },
+    { timestamp: '2026-05-12T08:03:00.900Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, cached_input_tokens: 20, output_tokens: 40, total_tokens: 260 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+})
+
+test('a thread_spawn file whose first two token_counts differ in second is not skipped', async () => {
+  // thread_spawn is present, but the first two usage-bearing token_counts fall in
+  // DIFFERENT seconds → no re-stamped replay block, so nothing is skipped. Mirrors
+  // ccusage detect_subagent_replay_second returning None when the seconds diverge.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'subagent-abc', source: { subagent: { thread_spawn: { parent_thread_id: 'parent-xyz' } } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 130 } } } },
+    { timestamp: '2026-05-12T08:04:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 50, cached_input_tokens: 5, output_tokens: 10, total_tokens: 60 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[1].metrics?.tokensInput, 50)
+})

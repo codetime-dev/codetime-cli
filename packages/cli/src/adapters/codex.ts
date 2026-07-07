@@ -69,6 +69,17 @@ async function parseCodexSessionFile(
   // (e.g. when only rate_limits metadata changes). Dedupe to avoid double-counting tokens
   // and inflating estimated cost.
   let lastTokenUsageKey: string | undefined
+  // Forked subagent rollouts (session_meta.source.subagent.thread_spawn) begin by
+  // REPLAYING the parent session's entire token history, all re-stamped at the
+  // subagent's creation second. The lastTokenUsageKey dedup above only catches
+  // *consecutive identical* records within a file — it cannot catch this replay,
+  // whose cumulative counts differ line to line, so the parent's usage (cached
+  // input especially) was being counted once per subagent file and inflating
+  // totals several-fold. Detect the replay block up front and skip its leading
+  // run of token_count events. Mirrors ccusage detect_subagent_replay_second
+  // (adapter/codex/parser.rs).
+  const replaySecond = detectSubagentReplaySecond(text, lines)
+  let skipReplay = replaySecond !== undefined
   const pendingToolCalls = new Map<string, { tool: string, startedAt: string, turnId: string | undefined }>()
   // Per-turn last activity timestamp and turn start timestamp. When we close a
   // turn implicitly (next user_message, or EOF fallback), turn.completed must
@@ -266,6 +277,15 @@ async function parseCodexSessionFile(
         }
         const usage = tokenUsageFromPayload(payload)
         if (usage) {
+          // Drop the leading run of replayed parent-history token_count events in a
+          // forked subagent rollout (all stamped at the replay second). The first
+          // event at a later second is the subagent's own usage and ends the skip.
+          if (skipReplay) {
+            if (ts.slice(0, 19) === replaySecond) {
+              break
+            }
+            skipReplay = false
+          }
           const usageKey = [
             usage.tokensInput,
             usage.tokensCachedInput,
@@ -594,6 +614,49 @@ function headlessCodexTimestamp(raw: Record<string, unknown>): string | undefine
       ?? timestampFrom(source.createdAt)
     if (ts) {
       return ts
+    }
+  }
+  return undefined
+}
+
+// Codex spawns a subagent into its own rollout file that opens by replaying the
+// parent session's token history, re-stamped at the subagent's creation second.
+// Return that second when this file is such a replay so the parser can drop the
+// leading token_count run stamped at it. A file qualifies only when it carries the
+// thread_spawn marker AND its first two usage-bearing token_count events share one
+// second (the tell-tale of a re-stamped replay block). Returns undefined otherwise
+// — including single-token_count files, where there is nothing to disambiguate.
+// Mirrors ccusage is_codex_subagent_session + detect_subagent_replay_second.
+function detectSubagentReplaySecond(text: string, lines: string[]): string | undefined {
+  if (!text.includes('thread_spawn')) {
+    return undefined
+  }
+  let firstSecond: string | undefined
+  for (const line of lines) {
+    const raw = parseJsonLine(line)
+    if (!raw || stringField(raw, 'type') !== 'event_msg') {
+      continue
+    }
+    const payload = objectField(raw, 'payload')
+    if (stringField(payload, 'type') !== 'token_count') {
+      continue
+    }
+    const info = objectField(payload, 'info')
+    const hasUsage = Object.keys(objectField(info, 'last_token_usage')).length > 0
+      || Object.keys(objectField(info, 'total_token_usage')).length > 0
+    if (!hasUsage) {
+      continue
+    }
+    const ts = timestampFrom(raw.timestamp) || timestampFrom(payload.timestamp)
+    if (!ts) {
+      continue
+    }
+    const second = ts.slice(0, 19)
+    if (firstSecond === undefined) {
+      firstSecond = second
+    }
+    else {
+      return firstSecond === second ? firstSecond : undefined
     }
   }
   return undefined
