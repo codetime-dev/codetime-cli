@@ -80,6 +80,12 @@ async function parseCodexSessionFile(
   // (adapter/codex/parser.rs).
   const replaySecond = detectSubagentReplaySecond(text, lines)
   let skipReplay = replaySecond !== undefined
+  // Running cumulative baseline. Some Codex builds emit token_count events that
+  // carry only info.total_token_usage (a cumulative), with no per-turn
+  // last_token_usage. For those we derive the turn's usage as current-minus-previous
+  // cumulative — so we must track the last cumulative we saw. Mirrors ccusage's
+  // previous_totals in subtract_codex_raw_usage.
+  let previousTotals: CodexCumulative = { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 }
   const pendingToolCalls = new Map<string, { tool: string, startedAt: string, turnId: string | undefined }>()
   // Per-turn last activity timestamp and turn start timestamp. When we close a
   // turn implicitly (next user_message, or EOF fallback), turn.completed must
@@ -275,7 +281,19 @@ async function parseCodexSessionFile(
         if (tierFromInfo) {
           serviceTier = tierFromInfo.toLowerCase()
         }
+        // Per-turn usage: prefer last_token_usage; otherwise derive the delta from
+        // the cumulative total_token_usage minus the running baseline, so token_count
+        // events that carry only a cumulative total are counted instead of dropped.
+        const totalUsage = objectField(info, 'total_token_usage')
+        const hasTotal = Object.keys(totalUsage).length > 0
         const usage = tokenUsageFromPayload(payload)
+          ?? (hasTotal ? codexUsageDelta(totalUsage, previousTotals, info) : undefined)
+        // Advance the baseline from every total_token_usage we see — including
+        // replayed events we skip — so the first real event's delta is measured
+        // against the right prior cumulative.
+        if (hasTotal) {
+          previousTotals = readCodexCumulative(totalUsage)
+        }
         if (usage) {
           // Drop the leading run of replayed parent-history token_count events in a
           // forked subagent rollout (all stamped at the replay second). The first
@@ -586,7 +604,9 @@ function headlessCodexUsage(raw: Record<string, unknown>) {
 
   return {
     tokensInput: input || undefined,
-    tokensCachedInput: cached || undefined,
+    // Clamp cached to input so non-cached (input - cached) never goes negative
+    // (ccusage cached.min(input) in the headless path too).
+    tokensCachedInput: Math.min(cached, input) || undefined,
     tokensOutput: billableOutput || undefined,
     tokensReasoningOutput: reasoning || undefined,
     tokensTotal: total,
@@ -669,12 +689,55 @@ export function tokenUsageFromPayload(payload: Record<string, unknown>) {
     return
   }
 
+  const input = numberField(usage, 'input_tokens')
+  const cached = numberField(usage, 'cached_input_tokens')
   return {
-    tokensInput: numberField(usage, 'input_tokens'),
-    tokensCachedInput: numberField(usage, 'cached_input_tokens'),
+    tokensInput: input,
+    // Cached input can never exceed total input; clamp so the server's
+    // non-cached = input - cached never goes negative (ccusage cached.min(input)).
+    tokensCachedInput: cached === undefined ? undefined : Math.min(cached, input ?? 0),
     tokensOutput: numberField(usage, 'output_tokens'),
     tokensReasoningOutput: numberField(usage, 'reasoning_output_tokens'),
     tokensTotal: numberField(usage, 'total_tokens'),
+    modelContextWindow: numberField(info, 'model_context_window'),
+  }
+}
+
+interface CodexCumulative { input: number, cached: number, output: number, reasoning: number, total: number }
+
+function readCodexCumulative(usage: Record<string, unknown>): CodexCumulative {
+  return {
+    input: numberField(usage, 'input_tokens') ?? 0,
+    cached: numberField(usage, 'cached_input_tokens') ?? 0,
+    output: numberField(usage, 'output_tokens') ?? 0,
+    reasoning: numberField(usage, 'reasoning_output_tokens') ?? 0,
+    total: numberField(usage, 'total_tokens') ?? 0,
+  }
+}
+
+// Per-turn delta from a cumulative total_token_usage minus the prior cumulative
+// baseline (ccusage subtract_codex_raw_usage). Returns undefined when the delta is
+// entirely zero (e.g. a repeated cumulative) so no empty usage event is emitted.
+function codexUsageDelta(
+  totalUsage: Record<string, unknown>,
+  previous: CodexCumulative,
+  info: Record<string, unknown>,
+) {
+  const cur = readCodexCumulative(totalUsage)
+  const input = Math.max(0, cur.input - previous.input)
+  const cached = Math.max(0, cur.cached - previous.cached)
+  const output = Math.max(0, cur.output - previous.output)
+  const reasoning = Math.max(0, cur.reasoning - previous.reasoning)
+  const total = Math.max(0, cur.total - previous.total)
+  if (input === 0 && cached === 0 && output === 0 && reasoning === 0 && total === 0) {
+    return
+  }
+  return {
+    tokensInput: input || undefined,
+    tokensCachedInput: Math.min(cached, input) || undefined,
+    tokensOutput: output || undefined,
+    tokensReasoningOutput: reasoning || undefined,
+    tokensTotal: total || undefined,
     modelContextWindow: numberField(info, 'model_context_window'),
   }
 }

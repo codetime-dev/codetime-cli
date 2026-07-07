@@ -246,6 +246,37 @@ test('parity: ccusage codex reports_non_cached_input_separately (codetime keeps 
   assert.equal(usages[0].metrics?.tokensTotal, 105)
 })
 
+test('parity: ccusage codex derives per-turn deltas from cumulative total_token_usage', async () => {
+  // token_count events carrying ONLY info.total_token_usage (no last_token_usage) —
+  // a real Codex shape. ccusage subtract_codex_raw_usage emits per-turn deltas
+  // against a running baseline; codetime must not drop them.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 's', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-01-02T00:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 } } } },
+    { timestamp: '2026-01-02T00:00:02.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 300, output_tokens: 130, total_tokens: 430 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[0].metrics?.tokensOutput, 50)
+  // second turn's delta: 300-100 input, 130-50 output.
+  assert.equal(usages[1].metrics?.tokensInput, 200)
+  assert.equal(usages[1].metrics?.tokensOutput, 80)
+})
+
+test('parity: ccusage codex clamps cached_input_tokens to input_tokens', async () => {
+  // cached must never exceed input, else the server's non-cached (input - cached)
+  // goes negative. ccusage clamps cached.min(input).
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 's', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-01-02T00:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 150, output_tokens: 50, total_tokens: 150 } } } },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[0].metrics?.tokensCachedInput, 100) // clamped from 150
+})
+
 test('parity: ccusage codex dedupes consecutive identical last_token_usage', async () => {
   // From ccusage adapter/codex/loader.rs dedupes_matching_codex_usage_events.
   const events = await parse([
@@ -355,6 +386,22 @@ test('parity: ccusage codex skips replayed parent token history in thread_spawn 
   assert.equal(usages[0].metrics?.tokensOutput, 20)
   assert.equal(usages[1].metrics?.tokensInput, 50)
   assert.equal(usages[1].metrics?.tokensOutput, 10)
+})
+
+test('parity: ccusage codex keeps_cumulative_baseline_when_skipping_subagent_replay', async () => {
+  // The replayed parent block (total-only, all at the creation second) is skipped
+  // BUT still advances the cumulative baseline, so the subagent's own first event
+  // (total 1600) yields delta 100 (1600 - 1500), not 1600. Mirrors ccusage's test.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'subagent', source: { subagent: { thread_spawn: { parent_thread_id: 'parent' } } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1000, output_tokens: 200, total_tokens: 1200 } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1500, output_tokens: 300, total_tokens: 1800 } } } },
+    { timestamp: '2026-05-12T08:04:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.2', total_token_usage: { input_tokens: 1600, output_tokens: 320, total_tokens: 1920 } } } },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[0].metrics?.tokensOutput, 20)
 })
 
 test('a non-subagent file whose first two token_counts share a second is NOT skipped', async () => {
