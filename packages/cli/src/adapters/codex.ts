@@ -1,6 +1,6 @@
 import type { CanonicalEvent } from '@codetime/shared'
 import type { AdapterEnv, AgentAdapter, InstallEntry } from './types.js'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 // Codex's fast/priority service_tier costs ~2× standard, so we encode the tier
 // into the model name (e.g. `gpt-5-codex-fast`) so the backend pricing table
@@ -31,6 +31,7 @@ import {
   stringField,
   stringRefs,
 } from '../lib/fields.js'
+import { listJsonlFiles } from '../lib/fs.js'
 import { durationMsBetween, durationObjectToMs, parseJsonLine, timestampFrom } from '../lib/jsonl.js'
 import { fileActivitiesFromShellCommand } from '../lib/shell.js'
 
@@ -876,10 +877,49 @@ export function createCodexAdapter(): AgentAdapter {
       const base = codexHome(home, env)
       return [
         path.join(base, 'sessions'),
+        // Codex moves old rollouts here as it rotates; include so pre-existing
+        // archived history is discovered, not silently dropped. Actual file
+        // listing dedups active vs archived — see codexBackfillFiles.
+        path.join(base, 'archived_sessions'),
         path.join(base, 'history.jsonl'),
       ]
     },
 
     parseSessionFile: parseCodexSessionFile,
   }
+}
+
+// Discover Codex session files across the active sessions/ dir AND the
+// archived_sessions/ dir Codex rotates old rollouts into, so rotated history is
+// still captured. When the same rollout exists in both (same relative path — a
+// leftover active copy), the active copy wins so its tokens are not counted
+// twice. Mirrors ccusage collect_deduped_codex_usage_files. A --source-root
+// override lists that root verbatim, with no active/archived merge.
+export async function codexBackfillFiles(
+  sourceRoot: string | undefined,
+  home: string,
+  env: AdapterEnv | undefined,
+): Promise<{ path: string, modifiedAt: string }[]> {
+  const files = sourceRoot ? await listJsonlFiles(sourceRoot) : await codexDefaultFiles(home, env)
+  return Promise.all(files.map(async (filePath) => {
+    const info = await stat(filePath)
+    return { path: filePath, modifiedAt: info.mtime.toISOString() }
+  }))
+}
+
+async function codexDefaultFiles(home: string, env: AdapterEnv | undefined): Promise<string[]> {
+  const base = codexHome(home, env)
+  const sessionsDir = path.join(base, 'sessions')
+  const archivedDir = path.join(base, 'archived_sessions')
+
+  const [activeFiles, archivedFiles, historyFiles] = await Promise.all([
+    listJsonlFiles(sessionsDir),
+    listJsonlFiles(archivedDir),
+    listJsonlFiles(path.join(base, 'history.jsonl')),
+  ])
+
+  const activeRelative = new Set(activeFiles.map(f => path.relative(sessionsDir, f)))
+  const dedupedArchived = archivedFiles.filter(f => !activeRelative.has(path.relative(archivedDir, f)))
+
+  return [...activeFiles, ...dedupedArchived, ...historyFiles]
 }

@@ -6,7 +6,7 @@ import path from 'node:path'
 import { Readable } from 'node:stream'
 // eslint-disable-next-line test/no-import-node-test -- This repo uses node:test as the runner.
 import { test } from 'node:test'
-import { createCodexAdapter } from '../src/adapters/codex.ts'
+import { codexBackfillFiles, createCodexAdapter } from '../src/adapters/codex.ts'
 import { run, syncLocalRunnerEntryArgs } from '../src/cli.ts'
 import { ensureLocalMachineId, machineIdPath, readConfig, writeConfig } from '../src/lib/config.ts'
 import { writeFileAtomic } from '../src/lib/fs.ts'
@@ -382,6 +382,69 @@ test('Codex parser ignores replayed parent session_meta in forked rollouts', asy
   const rollups = JSON.parse(capturedBody).rollups
   assert.equal(rollups.length, 1)
   assert.equal(rollups[0].sessionId, 'child-id')
+})
+
+test('backfill import --force is non-destructive: re-imports without purging server rollups', async () => {
+  const home = await createCodexBackfillHome()
+  const calls: Array<{ method: string, url: string }> = []
+
+  const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--force', '--json'], testContext({
+    stdout: { write: () => {} },
+    fetch: async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase()
+      calls.push({ method, url: String(url) })
+      if (method === 'DELETE') {
+        return Response.json({ deleted: 3 }, { status: 200 })
+      }
+      const rollups = JSON.parse(String(init?.body)).rollups
+      return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
+    },
+  }))
+
+  assert.equal(exitCode, 0)
+  // No DELETE (purge) is issued — the rollups are overwritten in place instead.
+  assert.equal(calls.some(c => c.method === 'DELETE'), false)
+  // The import still ran: an ingest POST was made.
+  assert.equal(calls.some(c => c.method === 'POST' && /\/v3\/agent\/ingest$/.test(c.url)), true)
+})
+
+test('backfill import --purge deletes this machine\'s rollups before re-importing', async () => {
+  const home = await createCodexBackfillHome()
+  const calls: Array<{ method: string, url: string }> = []
+
+  const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--purge', '--json'], testContext({
+    stdout: { write: () => {} },
+    fetch: async (url, init) => {
+      const method = (init?.method || 'GET').toUpperCase()
+      calls.push({ method, url: String(url) })
+      if (method === 'DELETE') {
+        return Response.json({ deleted: 3 }, { status: 200 })
+      }
+      const rollups = JSON.parse(String(init?.body)).rollups
+      return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
+    },
+  }))
+
+  assert.equal(exitCode, 0)
+  assert.equal(calls.some(c => c.method === 'DELETE' && /\/v3\/agent\/sessions\?source=codex$/.test(c.url)), true)
+})
+
+test('codexBackfillFiles discovers archived_sessions and prefers the active copy on collision', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const sessions = path.join(home, '.codex', 'sessions')
+  const archived = path.join(home, '.codex', 'archived_sessions')
+  await mkdir(sessions, { recursive: true })
+  await mkdir(archived, { recursive: true })
+  await writeFile(path.join(sessions, 'a.jsonl'), '{}', 'utf8')
+  await writeFile(path.join(archived, 'a.jsonl'), '{}', 'utf8') // same relative path — active wins
+  await writeFile(path.join(archived, 'b.jsonl'), '{}', 'utf8') // archived-only — kept
+
+  const discovered = await codexBackfillFiles(undefined, home, undefined)
+  const files = new Set(discovered.map(f => f.path))
+
+  assert.equal(files.has(path.join(sessions, 'a.jsonl')), true)
+  assert.equal(files.has(path.join(archived, 'b.jsonl')), true)
+  assert.equal(files.has(path.join(archived, 'a.jsonl')), false) // deduped in favor of active
 })
 
 test('backfill import sends parsed Codex events and counts API results', async () => {

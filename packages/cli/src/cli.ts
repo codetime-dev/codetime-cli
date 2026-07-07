@@ -22,7 +22,7 @@ import {
 import { cac } from 'cac'
 import { ampBackfillFiles, createAmpAdapter } from './adapters/amp.js'
 import { createClaudeCodeAdapter } from './adapters/claude-code.js'
-import { createCodexAdapter } from './adapters/codex.js'
+import { codexBackfillFiles, createCodexAdapter } from './adapters/codex.js'
 import { createGeminiAdapter, geminiBackfillFiles } from './adapters/gemini.js'
 import { createOpenCodeAdapter, opencodeBackfillFiles } from './adapters/opencode.js'
 import { createPiAdapter } from './adapters/pi.js'
@@ -172,7 +172,8 @@ function createCli(ctx: RunContext, registry: AdapterRegistry) {
     .option('--batch-bytes <bytes>', 'Soft byte cap for the JSON body of a single ingest POST')
     .option('--replace', 'Replace conflicting records during import (default)')
     .option('--skip-conflicts', 'Skip conflicting records instead of replacing them')
-    .option('--force', 'Force full re-import: clear watermark and re-process all files')
+    .option('--force', 'Full re-import: re-parse every file and overwrite matching rollups (non-destructive — nothing is deleted)')
+    .option('--purge', 'Before re-importing, delete THIS machine\'s existing rollups for the source(s). Destructive: also removes rollups whose local files are gone. Implies --force')
     .action((action, options) => backfillCommand({ ...normalizeOptions(options), action }, ctx, registry))
 
   // `sync` is the friendly front door to the upload path: it just runs
@@ -185,7 +186,8 @@ function createCli(ctx: RunContext, registry: AdapterRegistry) {
     .option('--until <time>', 'Only include history before this time')
     .option('--project <name>', 'Project filter')
     .option('--batch-size <count>', 'Max rollups per request (also bounded by --batch-bytes)')
-    .option('--force', 'Force full re-import: clear watermark and re-process all files')
+    .option('--force', 'Full re-import: re-parse every file and overwrite matching rollups (non-destructive — nothing is deleted)')
+    .option('--purge', 'Before re-importing, delete THIS machine\'s existing rollups for the source(s). Destructive: also removes rollups whose local files are gone. Implies --force')
     .option('--dry-run', 'Print the planned import without uploading')
     .action((options) => {
       const opts = normalizeOptions(options)
@@ -640,6 +642,12 @@ async function listBackfillSourceFiles(
   if (source.id === 'gemini') {
     return geminiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
   }
+  if (source.id === 'codex') {
+    const files = await codexBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+    return files
+      .sort((a, b) => a.path.localeCompare(b.path))
+      .slice(0, numberOption(options.limit) || undefined)
+  }
 
   const roots = stringOption(options['source-root'])
     ? [requiredOption(options, 'source-root')]
@@ -739,8 +747,17 @@ async function importBackfillPlan(
     .filter(a => supportedSources.has(a.id) && (source === 'all' || a.id === source))
     .map(a => ({ id: a.id, label: a.label, paths: a.sourcePaths(home, ctx.env) }))
 
-  if (options.force) {
-    await purgeForcedSources(sourceDefs, home, options, ctx)
+  // --purge (opt-in, destructive): drop this machine's existing rollups for the
+  // source(s) BEFORE re-importing. Without it, --force is non-destructive: it
+  // re-parses every file and overwrites matching rollups via replace:true, so
+  // rollups for files that have since rolled off disk are preserved, not deleted.
+  if (options.purge) {
+    await purgeSourceRollups(sourceDefs, options, ctx)
+  }
+  // Both --force and --purge re-import everything: clear the watermark so no file
+  // is skipped as "already imported".
+  if (options.force || options.purge) {
+    await clearBackfillWatermark(home, ctx)
   }
 
   const incrementalState = shouldUseIncrementalBackfill(options)
@@ -782,16 +799,11 @@ async function importBackfillPlan(
   return counts.failed > 0 || (counts.conflicts > 0 && !options['skip-conflicts']) ? 1 : 0
 }
 
-// Clear the local watermark and ask the server to drop existing
-// rollups for each target source. Errors are non-fatal — we surface
-// them via debug and let the import proceed, since the user
-// explicitly asked for --force.
-async function purgeForcedSources(
-  sourceDefs: Array<{ id: BackfillSourceId, label: string, paths: string[] }>,
-  home: string,
-  options: ParsedArgs,
-  ctx: RunContext,
-): Promise<void> {
+// Non-destructive half of a full re-import: drop the local watermark so the next
+// parse re-reads every file. Nothing is deleted server-side — re-parsed rollups
+// overwrite their prior versions in place via replace:true, and rollups for files
+// no longer on disk are simply left untouched (preserved).
+async function clearBackfillWatermark(home: string, ctx: RunContext): Promise<void> {
   try {
     // rm({force: true}) already swallows ENOENT, so anything reaching
     // here is a real I/O / permission problem.
@@ -800,7 +812,18 @@ async function purgeForcedSources(
   catch (error) {
     debug(ctx, `Failed to clear backfill watermark: ${(error as Error).message}\n`)
   }
+}
 
+// Destructive, opt-in via --purge: ask the server to drop this machine's existing
+// rollups for each target source before reimporting. This removes rollups whose
+// local files have rolled off disk, so use it only to clean up stale/incorrect
+// data — routine re-imports should use --force. Errors are non-fatal; the import
+// proceeds regardless.
+async function purgeSourceRollups(
+  sourceDefs: Array<{ id: BackfillSourceId, label: string, paths: string[] }>,
+  options: ParsedArgs,
+  ctx: RunContext,
+): Promise<void> {
   for (const item of sourceDefs) {
     try {
       const deleted = await deleteSessionRollupsBySourceAPI(item.id, options, ctx)
