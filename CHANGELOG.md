@@ -1,3 +1,11 @@
+## v0.7.5
+
+[v0.7.4...v0.7.5](https://github.com/codetime-dev/codetime-cli/compare/v0.7.4...v0.7.5)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: skip copied Codex branch rollout history via UUIDv7 creation anchor (fixes fork-file token/duration double-count; schema v6 re-parses history on next sync) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [a66e2b3](https://github.com/codetime-dev/codetime-cli/commit/a66e2b3)
+
 ## v0.7.4
 
 [v0.7.3...v0.7.4](https://github.com/codetime-dev/codetime-cli/compare/v0.7.3...v0.7.4)
