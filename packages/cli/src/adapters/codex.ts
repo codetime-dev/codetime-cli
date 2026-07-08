@@ -81,6 +81,15 @@ async function parseCodexSessionFile(
   // (adapter/codex/parser.rs).
   const replaySecond = detectSubagentReplaySecond(text, lines)
   let skipReplay = replaySecond !== undefined
+  // Branch/goal/resume forks copy the parent rollout's lines VERBATIM into the
+  // new file, keeping the original timestamps — nothing is re-stamped, so the
+  // same-second heuristic above can't catch them. But the file's own events can
+  // only be stamped after its creation instant, which the filename's UUIDv7
+  // embeds in UTC (the readable filename timestamp is LOCAL time — never use
+  // it). Any event_msg/response_item older than that instant is copied history.
+  // Covers what ccusage's cross-file dedupe catches, but per-file, so
+  // incremental re-parses of the live branch file alone stay correct.
+  const creationMs = rolloutCreationMs(filePath)
   // Running cumulative baseline. Some Codex builds emit token_count events that
   // carry only info.total_token_usage (a cumulative), with no per-turn
   // last_token_usage. For those we derive the turn's usage as current-minus-previous
@@ -209,6 +218,21 @@ async function parseCodexSessionFile(
     }
 
     if (topType !== 'event_msg' && topType !== 'response_item') {
+      continue
+    }
+
+    // Copied history from an earlier session (see creationMs above). Skip the
+    // line entirely — counting it would double the parent's tokens, prompts,
+    // tool calls, and active duration — but still advance the cumulative
+    // baseline from copied token_counts so the first live event's delta is
+    // measured against the copied prior cumulative, not zero.
+    if (creationMs !== undefined && Date.parse(ts) < creationMs) {
+      if (payloadType === 'token_count') {
+        const copiedTotal = objectField(objectField(payload, 'info'), 'total_token_usage')
+        if (Object.keys(copiedTotal).length > 0) {
+          previousTotals = readCodexCumulative(copiedTotal)
+        }
+      }
       continue
     }
 
@@ -638,6 +662,23 @@ function headlessCodexTimestamp(raw: Record<string, unknown>): string | undefine
     }
   }
   return undefined
+}
+
+// Codex rollout filenames are `rollout-<LOCAL time>-<UUIDv7>.jsonl`. The UUIDv7's
+// first 48 bits are the creation instant in Unix ms (UTC) — verified against real
+// rollouts across codex 0.4x–0.80, always within ~15ms of (and never after) the
+// file's first own event. The readable timestamp is local time and MUST NOT be
+// compared against event timestamps (which are UTC). Returns undefined for
+// non-rollout names (headless logs, history.jsonl), disabling the anchor.
+const ROLLOUT_UUID7_RE = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/
+
+function rolloutCreationMs(filePath: string): number | undefined {
+  const match = path.basename(filePath).match(ROLLOUT_UUID7_RE)
+  if (!match) {
+    return undefined
+  }
+  const ms = Number.parseInt(match[1] + match[2], 16)
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
 }
 
 // Codex spawns a subagent into its own rollout file that opens by replaying the

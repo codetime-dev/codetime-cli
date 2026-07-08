@@ -10,11 +10,30 @@ import { buildSessionRollups } from '../src/backfill/rollup.ts'
 
 const adapter = createCodexAdapter()
 
-async function parse(records: unknown[]): Promise<CanonicalEvent[]> {
+async function parseFile(fileName: string, records: unknown[]): Promise<CanonicalEvent[]> {
   const dir = await mkdtemp(path.join(tmpdir(), 'codex-'))
-  const file = path.join(dir, 'session.jsonl')
+  const file = path.join(dir, fileName)
   await writeFile(file, records.map(record => JSON.stringify(record)).join('\n'), 'utf8')
   return adapter.parseSessionFile!(file, { _: [] })
+}
+
+async function parse(records: unknown[]): Promise<CanonicalEvent[]> {
+  return parseFile('session.jsonl', records)
+}
+
+// Build a UUIDv7 whose embedded 48-bit millisecond timestamp equals the given
+// instant, mirroring real Codex rollout ids. Verified against real rollouts:
+// the uuid ms always precedes the file's first own event by a few ms.
+function uuidv7At(iso: string): string {
+  const hex = Date.parse(iso).toString(16).padStart(12, '0')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-7000-8000-000000000000`
+}
+
+// Real Codex rollout filenames stamp LOCAL time in the readable part while event
+// timestamps are UTC (e.g. JST names run 9h ahead). Deliberately use a +9h-style
+// readable part so any implementation that parses it instead of the UUIDv7 fails.
+function rolloutFileName(creationIso: string): string {
+  return `rollout-2026-05-12T17-02-00-${uuidv7At(creationIso)}.jsonl`
 }
 
 function usageEvents(events: CanonicalEvent[]): CanonicalEvent[] {
@@ -430,4 +449,103 @@ test('a thread_spawn file whose first two token_counts differ in second is not s
   assert.equal(usages.length, 2)
   assert.equal(usages[0].metrics?.tokensInput, 100)
   assert.equal(usages[1].metrics?.tokensInput, 50)
+})
+
+// ── copied branch/goal rollout history (verbatim copy, original timestamps) ──
+//
+// Codex branch/goal/resume forks copy the parent rollout's lines verbatim into a
+// new file, keeping the ORIGINAL timestamps. The same-second replay heuristic
+// above cannot catch those (nothing is re-stamped), and they escape the
+// consecutive-identical dedupe too. The file's own events can only be stamped
+// after its creation instant, which the filename's UUIDv7 carries in UTC — so any
+// event_msg/response_item older than that instant is copied history. Mirrors the
+// coverage of ccusage's cross-file dedupe (dedupes_copied_branch_history_across_
+// session_files), but works on a single file, so incremental re-parses of the
+// live branch file alone stay correct without the parent in memory.
+
+test('parity: ccusage codex dedupes_copied_branch_history — pre-creation events are skipped via the UUIDv7 anchor', async () => {
+  const creation = '2026-05-12T08:02:00.000Z'
+  const events = await parseFile(rolloutFileName(creation), [
+    // copied verbatim from the parent rollout — original (pre-creation) timestamps
+    { timestamp: '2026-05-12T08:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5.2' } },
+    { timestamp: '2026-05-12T08:01:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200, reasoning_output_tokens: 20, total_tokens: 1200 } } } },
+    // the branch's own usage — cumulative continues from the copied baseline
+    { timestamp: '2026-05-12T08:02:30.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1600, cached_input_tokens: 300, output_tokens: 450, reasoning_output_tokens: 40, total_tokens: 2050 } } } },
+  ])
+
+  // Only the branch's own delta is counted, measured against the copied
+  // baseline (1600-1000 etc.), matching ccusage's expected branch totals.
+  const usages = usageEvents(events)
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 600)
+  assert.equal(usages[0].metrics?.tokensCachedInput, 200)
+  assert.equal(usages[0].metrics?.tokensOutput, 250)
+  assert.equal(usages[0].metrics?.tokensReasoningOutput, 20)
+  assert.equal(usages[0].metrics?.tokensTotal, 850)
+})
+
+test('copied pre-creation activity events (prompts/tools) are dropped, not just token_counts', async () => {
+  // The copied block contains the parent's prompts and tool calls too. Counting
+  // them would double the parent's prompts, toolCalls, and active duration.
+  const creation = '2026-05-12T08:02:00.000Z'
+  const events = await parseFile(rolloutFileName(creation), [
+    { timestamp: '2026-05-12T07:50:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'copied parent prompt' } },
+    { timestamp: '2026-05-12T07:51:00.000Z', type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'copied-call', arguments: '{"command":"ls"}' } },
+    { timestamp: '2026-05-12T07:51:05.000Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'copied-call' } },
+    // the branch's own activity
+    { timestamp: '2026-05-12T08:02:10.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'own prompt' } },
+    { timestamp: '2026-05-12T08:02:20.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 120 } } } },
+  ])
+
+  const prompts = events.filter(event => event.type === 'prompt.submitted')
+  assert.equal(prompts.length, 1)
+  assert.equal(prompts[0].ts, '2026-05-12T08:02:10.000Z')
+  assert.equal(events.filter(event => event.type === 'tool.started').length, 0)
+  assert.equal(events.filter(event => event.type === 'tool.completed').length, 0)
+  assert.equal(usageEvents(events).length, 1)
+})
+
+test('a normal rollout file keeps every event at or after its UUIDv7 creation instant', async () => {
+  // Guard against over-eager dropping: events stamped exactly AT the creation
+  // millisecond and later are the file's own and must all survive.
+  const creation = '2026-05-12T08:02:00.000Z'
+  const usages = usageEvents(await parseFile(rolloutFileName(creation), [
+    { timestamp: creation, type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'gpt-5' } },
+    { timestamp: '2026-05-12T08:02:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 130 } } } },
+    { timestamp: '2026-05-12T08:05:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, cached_input_tokens: 20, output_tokens: 40, total_tokens: 260 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[1].metrics?.tokensInput, 200)
+})
+
+test('files without a UUIDv7 rollout name never trigger the creation anchor', async () => {
+  // Same copied-history shape as the parity test, but in a plain-named file
+  // (headless logs, history.jsonl, tests): no anchor → nothing is dropped.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-12T08:01:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200, total_tokens: 1200 } } } },
+    { timestamp: '2026-05-12T08:02:30.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1600, cached_input_tokens: 300, output_tokens: 450, total_tokens: 2050 } } } },
+  ]))
+
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensInput, 1000)
+  assert.equal(usages[1].metrics?.tokensInput, 600)
+})
+
+test('the same-second thread_spawn replay skip still works in a UUIDv7-named file', async () => {
+  // Re-stamped replays are stamped AT the creation second — at or after the
+  // uuid instant, so the anchor cannot catch them; the layer-1 same-second
+  // heuristic must keep firing unchanged alongside the anchor.
+  const creation = '2026-05-12T08:03:00.000Z'
+  const usages = usageEvents(await parseFile(rolloutFileName(creation), [
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'subagent-abc', source: { subagent: { thread_spawn: { parent_thread_id: 'parent-xyz' } } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'session_meta', payload: { id: 'parent-xyz' } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 1000, cached_input_tokens: 100, output_tokens: 200, total_tokens: 1200 } } } },
+    { timestamp: '2026-05-12T08:03:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 500, cached_input_tokens: 50, output_tokens: 100, total_tokens: 600 } } } },
+    { timestamp: '2026-05-12T08:04:00.000Z', type: 'event_msg', payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 120 } } } },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
 })

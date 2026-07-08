@@ -34,12 +34,14 @@ export interface BackfillSourceFile {
 // Codex fast/priority from CODEX_HOME/config.toml, and the v5 batch of
 // ccusage-parity token fixes — OpenCode step-finish double-count, Amp
 // tokens.total / ledger-less fallback, Codex cumulative-only token_count,
-// and the pi/gemini edge cases). The CLI compares the constant against
-// the on-disk schema; on a mismatch it drops every watermark so the next
-// sync silently re-parses all jsonl from scratch and upserts the rebuilt
-// rollups (`replace: true` is already set) — no purge, nothing deleted.
-// Users get the fix transparently the next time their agent runs.
-export const BACKFILL_STATE_SCHEMA_VERSION = 5
+// and the pi/gemini edge cases, and the v6 Codex UUIDv7 creation-anchor
+// that skips copied branch/goal rollout history). The CLI compares the
+// constant against the on-disk schema; on a mismatch it drops every
+// watermark so the next sync silently re-parses all jsonl from scratch
+// and upserts the rebuilt rollups (`replace: true` is already set) — no
+// purge, nothing deleted. Users get the fix transparently the next time
+// their agent runs.
+export const BACKFILL_STATE_SCHEMA_VERSION = 6
 
 export interface BackfillIncrementalState {
   version: typeof BACKFILL_STATE_SCHEMA_VERSION
