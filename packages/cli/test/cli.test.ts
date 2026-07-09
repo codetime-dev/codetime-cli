@@ -1,6 +1,6 @@
 import type { RunContext } from '../src/lib/types.ts'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
@@ -445,6 +445,36 @@ test('codexBackfillFiles discovers archived_sessions and prefers the active copy
   assert.equal(files.has(path.join(sessions, 'a.jsonl')), true)
   assert.equal(files.has(path.join(archived, 'b.jsonl')), true)
   assert.equal(files.has(path.join(archived, 'a.jsonl')), false) // deduped in favor of active
+})
+
+test('symlinked Codex home yields the same rollup identity as the real path', async () => {
+  const home = await createCodexBackfillHome()
+  // Multi-account setups point CODEX_HOME at a shadow dir that symlinks the
+  // real ~/.codex; a hook-triggered sync sees the shadow path while a manual
+  // sync sees the real one. Both must resolve to one rollup identity.
+  const shadowCodexHome = path.join(home, '.codex-shadow')
+  await symlink(path.join(home, '.codex'), shadowCodexHome, 'dir')
+
+  const importOnce = async (env: Record<string, string>) => {
+    let body = ''
+    const exitCode = await run(['backfill', 'import', '--source', 'codex', '--home', home, '--api-url', 'http://example.test', '--force', '--json'], testContext({
+      env: { HOME: home, ...env },
+      fetch: async (_url, init) => {
+        body = String(init?.body)
+        const rollups = JSON.parse(body).rollups
+        return Response.json({ inserted: rollups.length, skipped: 0, conflicts: 0, conflictIds: [] }, { status: 200 })
+      },
+    }))
+    assert.equal(exitCode, 0)
+    return JSON.parse(body).rollups
+  }
+
+  const direct = await importOnce({})
+  const viaSymlink = await importOnce({ CODEX_HOME: shadowCodexHome })
+
+  assert.equal(direct.length, 1)
+  assert.equal(viaSymlink.length, 1)
+  assert.equal(viaSymlink[0].rollupKey, direct[0].rollupKey)
 })
 
 test('backfill import sends parsed Codex events and counts API results', async () => {

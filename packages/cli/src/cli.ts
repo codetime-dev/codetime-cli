@@ -8,7 +8,7 @@ import type {
 import type { BackfillSourceDefinition } from './lib/backfill.js'
 import type { BackfillImportCounts, BackfillIncrementalState, BackfillSourceFile, ParsedArgs, RunContext, SyncLocalLock, SyncLocalTriggerState, WritableLike } from './lib/types.js'
 import { spawn } from 'node:child_process'
-import { rm, stat } from 'node:fs/promises'
+import { realpath, rm, stat } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -634,19 +634,19 @@ async function listBackfillSourceFiles(
   ctx: RunContext,
 ): Promise<BackfillSourceFile[]> {
   if (source.id === 'opencode') {
-    return opencodeBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+    return canonicalizeBackfillFiles(await opencodeBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env))
   }
   if (source.id === 'amp') {
-    return ampBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+    return canonicalizeBackfillFiles(await ampBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env))
   }
   if (source.id === 'gemini') {
-    return geminiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
+    return canonicalizeBackfillFiles(await geminiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env))
   }
   if (source.id === 'codex') {
     const files = await codexBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
-    return files
+    return canonicalizeBackfillFiles(files
       .sort((a, b) => a.path.localeCompare(b.path))
-      .slice(0, numberOption(options.limit) || undefined)
+      .slice(0, numberOption(options.limit) || undefined))
   }
 
   const roots = stringOption(options['source-root'])
@@ -658,10 +658,38 @@ async function listBackfillSourceFiles(
     .sort()
     .slice(0, numberOption(options.limit) || undefined)
 
-  return Promise.all(files.map(async (filePath) => {
+  return canonicalizeBackfillFiles(await Promise.all(files.map(async (filePath) => {
     const info = await stat(filePath)
     return { path: filePath, modifiedAt: info.mtime.toISOString() }
-  }))
+  })))
+}
+
+// Rollup identity includes a hash of the file's absolute path, so the same
+// physical file reached through different paths (symlinked agent homes like
+// CODEX_HOME=~/.codex-work → ~/.codex, macOS /var → /private/var) would
+// otherwise upload duplicate rollups — a hook-triggered sync and a manual one
+// can legitimately see different spellings of the same home. Resolve every
+// listed file to its physical path before parsing so all views agree on one
+// identity, and drop same-run duplicates that collapse together.
+async function canonicalizeBackfillFiles(files: BackfillSourceFile[]): Promise<BackfillSourceFile[]> {
+  const seen = new Set<string>()
+  const result: BackfillSourceFile[] = []
+  for (const file of files) {
+    let resolved = file.path
+    try {
+      resolved = await realpath(file.path)
+    }
+    catch {
+      // Keep the literal path: a file that vanished between listing and now
+      // (or an unreadable parent) still fails later with proper per-file logging.
+    }
+    if (seen.has(resolved)) {
+      continue
+    }
+    seen.add(resolved)
+    result.push(resolved === file.path ? file : { ...file, path: resolved })
+  }
+  return result
 }
 
 function writeBackfillDiscover(plan: BackfillPlan, options: ParsedArgs, ctx: RunContext) {
