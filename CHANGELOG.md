@@ -1,3 +1,11 @@
+## v0.7.6
+
+[v0.7.5...v0.7.6](https://github.com/codetime-dev/codetime-cli/compare/v0.7.5...v0.7.6)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: canonicalize backfill file paths via realpath so symlinked agent homes (e.g. multi-account CODEX_HOME shadows) stop uploading duplicate rollups (schema v7 re-parses history on next sync; if you use symlinked homes, run `codetime sync --purge --source <source>` once after updating to clear old duplicates) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [73dba96](https://github.com/codetime-dev/codetime-cli/commit/73dba96)
+
 ## v0.7.5
 
 [v0.7.4...v0.7.5](https://github.com/codetime-dev/codetime-cli/compare/v0.7.4...v0.7.5)
