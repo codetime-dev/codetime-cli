@@ -41,13 +41,20 @@ export interface BackfillSourceFile {
 // fixes — `session_meta.model_provider` is no longer stored as the model,
 // the model is seeded from the first `turn_context`, `codex-auto-review`
 // resolves to the review model shipping on that date, and a proxy's
-// effort parenthetical is stripped). The CLI compares the
+// effort parenthetical is stripped, and the v9 Codex replay-dedup batch —
+// a re-emitted `last_token_usage` is dropped when the cumulative
+// `total_token_usage` did not advance, and a forked rollout's replayed
+// history is matched against its parent's own usage stream instead of the
+// same-second heuristic, which missed replays spanning several seconds and
+// nested forks, and the v9 Claude advisor fix — `advisor_message` entries in
+// `message.usage.iterations[]` are a different model's call that the enclosing
+// usage does not carry, so their tokens were being dropped). The CLI compares the
 // constant against the on-disk schema; on a mismatch it drops every
 // watermark so the next sync silently re-parses all jsonl from scratch
 // and upserts the rebuilt rollups (`replace: true` is already set) — no
 // purge, nothing deleted. Users get the fix transparently the next time
 // their agent runs.
-export const BACKFILL_STATE_SCHEMA_VERSION = 8
+export const BACKFILL_STATE_SCHEMA_VERSION = 9
 
 export interface BackfillIncrementalState {
   version: typeof BACKFILL_STATE_SCHEMA_VERSION
