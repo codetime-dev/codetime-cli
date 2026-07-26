@@ -1,3 +1,11 @@
+## v0.7.7
+
+[v0.7.6...v0.7.7](https://github.com/codetime-dev/codetime-cli/compare/v0.7.6...v0.7.7)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: stop storing Codex `session_meta.model_provider` as the model — the provider id (`openai`, or a proxy's own name) was landing in the model leaderboard and pricing at $0; the model is now seeded from the first `turn_context`, `codex-auto-review` resolves to the review model shipping on that date (ccusage parity), and a proxy's effort parenthetical (`gpt-5.5(xhigh)`) is stripped (schema v8 re-parses history on next sync) - By [Jianqi Pan](mailto:jannchie@gmail.com)
+
 ## v0.7.6
 
 [v0.7.5...v0.7.6](https://github.com/codetime-dev/codetime-cli/compare/v0.7.5...v0.7.6)
