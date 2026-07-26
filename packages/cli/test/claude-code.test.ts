@@ -134,3 +134,136 @@ test('divergence: claude does NOT drop sidechain replay with a new requestId', a
   assert.equal(usages.length, 2)
   assert.equal(totalCacheRead, 20 + 50_000)
 })
+
+// ── advisor-model iterations ──
+//
+// `message.usage.iterations[]` breaks an assistant message into the calls that
+// produced it. Main-model (`type: "message"`) entries are already summed into the
+// enclosing usage; `advisor_message` entries are a different model's call whose
+// tokens the enclosing usage does not carry. Mirrors ccusage #1423.
+
+test('parity: ccusage claude calculates_advisor_cost_with_the_advisor_model', async () => {
+  // Fixture from ccusage adapter/claude/mod.rs
+  // calculates_advisor_cost_with_the_advisor_model.
+  const usages = usageEvents(await parse([
+    assistant('req-parent', 'msg-parent', {
+      input_tokens: 1,
+      output_tokens: 2,
+      iterations: [{
+        type: 'advisor_message',
+        model: 'advisor-model',
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      }],
+    } as unknown as Record<string, number>),
+  ]))
+
+  assert.equal(usages.length, 2)
+  // The main model's totals are untouched.
+  assert.equal(usages[0].model, 'claude-sonnet-4-20250514')
+  assert.equal(usages[0].metrics?.tokensInput, 1)
+  assert.equal(usages[0].metrics?.tokensOutput, 2)
+  // The advisor's tokens are attributed to the advisor's own model.
+  assert.equal(usages[1].model, 'advisor-model')
+  assert.equal(usages[1].metrics?.tokensInput, 10)
+  assert.equal(usages[1].metrics?.tokensOutput, 2)
+  assert.equal(usages[1].metrics?.modelCalls, 1)
+  // Distinct import identities, or the server would treat one as a repeat of the other.
+  assert.notEqual(usages[0].id, usages[1].id)
+  assert.notEqual(usages[0].refs?.importKey, usages[1].refs?.importKey)
+})
+
+test('main-model iterations are never counted twice', async () => {
+  // Real transcripts carry a `type: "message"` iteration whose counts equal the
+  // enclosing usage exactly (verified across 201 such lines locally). Expanding
+  // those would double every assistant message. Today those entries carry no
+  // `model`, but the type check — not the missing field — has to be what stops
+  // them, so this fixture supplies a model the filter must ignore.
+  const usages = usageEvents(await parse([
+    assistant('req-1', 'msg-1', {
+      input_tokens: 2,
+      output_tokens: 234,
+      cache_creation_input_tokens: 29_586,
+      cache_read_input_tokens: 0,
+      iterations: [{
+        type: 'message',
+        model: 'claude-sonnet-4-20250514',
+        input_tokens: 2,
+        output_tokens: 234,
+        cache_creation_input_tokens: 29_586,
+        cache_read_input_tokens: 0,
+      }],
+    } as unknown as Record<string, number>),
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensOutput, 234)
+})
+
+test('advisor iterations inherit the TTL split and skip malformed entries', async () => {
+  const usages = usageEvents(await parse([
+    assistant('req-1', 'msg-1', {
+      input_tokens: 1,
+      output_tokens: 2,
+      iterations: [
+        // No model → cannot be priced, so it is not emitted.
+        { type: 'advisor_message', input_tokens: 5, output_tokens: 1 },
+        // Not an object.
+        'garbage',
+        {
+          type: 'advisor_message',
+          model: 'advisor-model',
+          input_tokens: 3,
+          output_tokens: 1,
+          cache_creation_input_tokens: 100,
+          cache_read_input_tokens: 7,
+          cache_creation: { ephemeral_5m_input_tokens: 40, ephemeral_1h_input_tokens: 60 },
+        },
+      ],
+    } as unknown as Record<string, number>),
+  ]))
+
+  assert.equal(usages.length, 2)
+  const advisor = usages[1]
+  assert.equal(advisor.model, 'advisor-model')
+  assert.equal(advisor.metrics?.tokensInput, 3 + 100 + 7) // cache-inclusive
+  assert.equal(advisor.metrics?.tokensCacheCreation5mInput, 40)
+  assert.equal(advisor.metrics?.tokensCacheCreation1hInput, 60)
+})
+
+test('two advisor iterations on one line get distinct import identities', async () => {
+  const events = await parse([
+    assistant('req-1', 'msg-1', {
+      input_tokens: 1,
+      output_tokens: 2,
+      iterations: [
+        { type: 'advisor_message', model: 'advisor-a', input_tokens: 3, output_tokens: 1 },
+        { type: 'advisor_message', model: 'advisor-b', input_tokens: 4, output_tokens: 1 },
+      ],
+    } as unknown as Record<string, number>),
+  ])
+
+  const usages = usageEvents(events)
+  assert.equal(usages.length, 3)
+  assert.equal(new Set(usages.map(usage => usage.id)).size, 3)
+})
+
+test('a duplicate assistant entry does not re-emit its advisor usage', async () => {
+  // The (messageId, requestId) dedup skips the whole entry, advisors included.
+  const usages = usageEvents(await parse([
+    assistant('req-1', 'msg-1', {
+      input_tokens: 1,
+      output_tokens: 2,
+      iterations: [{ type: 'advisor_message', model: 'advisor-model', input_tokens: 10, output_tokens: 2 }],
+    } as unknown as Record<string, number>),
+    assistant('req-1', 'msg-1', {
+      input_tokens: 1,
+      output_tokens: 2,
+      iterations: [{ type: 'advisor_message', model: 'advisor-model', input_tokens: 10, output_tokens: 2 }],
+    } as unknown as Record<string, number>),
+  ]))
+
+  assert.equal(usages.length, 2)
+})

@@ -268,6 +268,26 @@ async function parseClaudeCodeSessionFile(
       }), lineNumber, topType, 'usage')
     }
 
+    // Advisor calls bill at their own model's rate and are not part of the usage
+    // above, so each becomes its own model.usage event. They need a sourceId: the
+    // import key is built from (source, file, line, type, sourceId), and without
+    // one every usage event on this line would collapse into the main model's id.
+    // The main event deliberately keeps no sourceId so its id stays stable.
+    for (const [advisorIndex, advisor] of claudeAdvisorUsages(message).entries()) {
+      push(baseClaudeEvent({
+        ts,
+        type: 'model.usage',
+        sessionId,
+        turnId: state.currentTurnId,
+        cwd,
+        project,
+        model: advisor.model,
+        confidence: 'partial',
+        metrics: advisor.usage,
+        refs: stringRefs({ sourceId: `advisor:${advisorIndex}` }),
+      }), lineNumber, topType, 'usage')
+    }
+
     for (const toolUse of claudeToolUseItems(message)) {
       const tool = stringField(toolUse, 'name') || 'tool'
       const toolUseId = stringField(toolUse, 'id') || `tool_${createStableHash([filePath, lineNumber, tool]).slice(0, 24)}`
@@ -373,7 +393,44 @@ function baseClaudeEvent(
 }
 
 export function claudeUsageFromMessage(message: Record<string, unknown>): Partial<MetricBag> | undefined {
-  const usage = objectField(message, 'usage')
+  return claudeUsageFromUsage(objectField(message, 'usage'))
+}
+
+/**
+ * Advisor-model calls folded into one assistant message.
+ *
+ * `message.usage.iterations[]` breaks the message down into the calls that
+ * produced it. Entries of type `message` are the main model's own iterations and
+ * are already summed into the enclosing `usage`, so counting them again would
+ * double the message. `advisor_message` entries are a *different* model's call
+ * whose tokens the enclosing usage does not carry — dropping them loses those
+ * tokens entirely and hides a model that bills at its own rate. Mirrors ccusage
+ * advisor_usages_from_line (adapter/claude/mod.rs, #1423).
+ */
+function claudeAdvisorUsages(
+  message: Record<string, unknown>,
+): { model: string, usage: Partial<MetricBag> }[] {
+  const iterations = objectField(message, 'usage').iterations
+  if (!Array.isArray(iterations)) {
+    return []
+  }
+  const advisors: { model: string, usage: Partial<MetricBag> }[] = []
+  for (const iteration of iterations) {
+    if (!isPlainObject(iteration) || stringField(iteration, 'type') !== 'advisor_message') {
+      continue
+    }
+    const model = stringField(iteration, 'model')
+    const usage = claudeUsageFromUsage(iteration)
+    if (model && usage) {
+      advisors.push({ model, usage })
+    }
+  }
+  return advisors
+}
+
+// Token counts live in the same field layout whether they come from
+// `message.usage` or from one of its `iterations[]` entries.
+function claudeUsageFromUsage(usage: Record<string, unknown>): Partial<MetricBag> | undefined {
   if (Object.keys(usage).length === 0) {
     return undefined
   }
