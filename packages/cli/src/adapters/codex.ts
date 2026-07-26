@@ -48,7 +48,9 @@ async function parseCodexSessionFile(
   let sessionId = sessionIdFromFilePath(filePath, 'codex')
   let cwd: string | undefined
   let project: string | undefined
-  let model: string | undefined
+  // `session_meta` has no model — only `model_provider` — so seed from the
+  // first `turn_context` up front. See firstCodexTurnContextModel.
+  let model: string | undefined = firstCodexTurnContextModel(lines)
   // Headless `codex exec` files have no session_meta; emit a synthetic
   // session.started on the first usage line so rollups still get a boundary.
   let sessionStartEmitted = false
@@ -149,7 +151,8 @@ async function parseCodexSessionFile(
       sessionId = stringField(payload, 'id') || sessionId
       cwd = stringField(payload, 'cwd') || cwd
       project = cwd ? path.basename(cwd) : project
-      model = stringField(payload, 'model_provider') || model
+      // Deliberately NOT reading `model_provider` here — see
+      // firstCodexTurnContextModel; `model` was seeded from it above.
       events.push(withBackfillRefs({
         schemaVersion: AGENT_TIME_SCHEMA_VERSION,
         ts,
@@ -171,7 +174,7 @@ async function parseCodexSessionFile(
       currentTurnId = stringField(payload, 'turn_id') || currentTurnId
       cwd = stringField(payload, 'cwd') || cwd
       project = cwd ? path.basename(cwd) : project
-      model = stringField(payload, 'model') || model
+      model = normalizeCodexModel(stringField(payload, 'model'), ts) || model
       // Codex hasn't shipped service_tier inside turn_context yet, but the field
       // is the natural per-turn location and the upstream protocol allows it.
       // Honor it when present so future Codex builds get accurate fast/priority
@@ -189,12 +192,9 @@ async function parseCodexSessionFile(
     if (topType === 'turn.completed' || topType === 'result' || topType === undefined) {
       const usage = headlessCodexUsage(raw)
       if (usage) {
-        const parsedModel = headlessCodexModel(raw)
-        if (parsedModel) {
-          model = parsedModel
-        }
-        const eventModel = parsedModel || model || 'gpt-5'
         const headlessTs = headlessCodexTimestamp(raw) || ts
+        model = normalizeCodexModel(headlessCodexModel(raw), headlessTs) || model
+        const eventModel = model || 'gpt-5'
         if (!sessionStartEmitted) {
           pushEvent(baseCodexEvent({
             ts: headlessTs,
@@ -565,6 +565,78 @@ async function parseCodexSessionFile(
 }
 
 // ── Codex-specific helpers ──
+
+// Codex stamps `codex-auto-review` as the model on its automatic code-review
+// turns. It is a label, not a model — the tokens are billed against whichever
+// review model Codex shipped on that date. Ported from ccusage's
+// codex_log_model_fallback + codex-auto-review-fallbacks.json
+// (rust/crates/ccusage/src/adapter/codex/parser.rs). Newest first; keep in
+// sync when ccusage refreshes its snapshot. Note the table stops at gpt-5.5,
+// so any review turn after 2026-04-23 resolves to it — upstream has not
+// published a gpt-5.6-era row. That is not cost-neutral (gpt-5.6-sol carries
+// an explicit cache-creation rate gpt-5.5 does not), just the best available
+// evidence about which model actually ran.
+const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review'
+const CODEX_AUTO_REVIEW_FALLBACKS: ReadonlyArray<{ releasedOn: string, model: string }> = [
+  { releasedOn: '2026-04-23', model: 'gpt-5.5' },
+  { releasedOn: '2026-03-05', model: 'gpt-5.4' },
+  { releasedOn: '2026-02-05', model: 'gpt-5.3-codex' },
+  { releasedOn: '2025-12-11', model: 'gpt-5.2-codex' },
+  { releasedOn: '2025-11-13', model: 'gpt-5.1-codex' },
+  { releasedOn: '2025-09-15', model: 'gpt-5-codex' },
+  { releasedOn: '2025-08-07', model: 'gpt-5' },
+]
+
+// Turn a raw Codex model string into a name the backend pricing catalogue can
+// resolve:
+//   - `gpt-5.5(xhigh)` / `gpt-5.4 (high)` — some third-party Codex proxies
+//     append the reasoning effort. It is not part of any catalogue id and
+//     pricing never varies by effort, so drop it.
+//   - `codex-auto-review` — resolve to the review model shipping at `ts`.
+function normalizeCodexModel(model: string | undefined, ts: string | undefined): string | undefined {
+  if (!model) {
+    return model
+  }
+  const cleaned = model.replace(/\s*\([^)]*\)\s*$/, '').trim() || model
+  if (cleaned !== CODEX_AUTO_REVIEW_MODEL) {
+    return cleaned
+  }
+  const date = ts?.slice(0, 10)
+  const fallback = date && /^\d{4}-\d{2}-\d{2}$/.test(date)
+    ? CODEX_AUTO_REVIEW_FALLBACKS.find(entry => date >= entry.releasedOn)
+    : undefined
+  // Pre-dating the whole table (or an unparseable ts) means the oldest
+  // release is the best guess — same default ccusage uses.
+  return fallback?.model ?? 'gpt-5'
+}
+
+// `session_meta` carries `model_provider` (an API provider id — `openai`, or
+// whatever name a proxy gives itself), never a model; the model lives in
+// `turn_context.model`. Scan ahead for the first one so events emitted before
+// the first turn_context (session.started, plus any usage line that precedes
+// it) still carry the real model. Reading `model_provider` into `model` is
+// how `openai` / `crs` / `custom` used to reach the model leaderboard.
+function firstCodexTurnContextModel(lines: string[]): string | undefined {
+  for (const line of lines) {
+    // Cheap reject first — re-parsing every line of a large rollout is not
+    // worth it when turn_context normally sits within the first few lines.
+    if (!line.includes('"turn_context"')) {
+      continue
+    }
+    const raw = parseJsonLine(line)
+    if (!raw || stringField(raw, 'type') !== 'turn_context') {
+      continue
+    }
+    const model = normalizeCodexModel(
+      stringField(objectField(raw, 'payload'), 'model'),
+      timestampFrom(raw.timestamp),
+    )
+    if (model) {
+      return model
+    }
+  }
+  return undefined
+}
 
 function rewriteCodexModelForTier(model: string | undefined, serviceTier: string | undefined): string | undefined {
   if (!model) {

@@ -549,3 +549,97 @@ test('the same-second thread_spawn replay skip still works in a UUIDv7-named fil
   assert.equal(usages.length, 1)
   assert.equal(usages[0].metrics?.tokensInput, 100)
 })
+
+// ── model naming ──
+//
+// The model that gets stored is the pricing key the backend looks up, so a
+// wrong name is a silently-$0 (or silently-mispriced) row rather than a
+// visible error.
+
+// Token numbers are irrelevant to these tests — only the model stamped on
+// the resulting usage event is.
+function tokenCount(timestamp: string): unknown {
+  return {
+    timestamp,
+    type: 'event_msg',
+    payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 50, total_tokens: 150 } } },
+  }
+}
+
+test('session_meta.model_provider is never used as the model', async () => {
+  // `model_provider` is the API provider id — `openai` for the real thing,
+  // or whatever a third-party proxy calls itself. Reading it into `model`
+  // is how `openai` / `crs` / `custom` used to reach the model leaderboard.
+  const events = await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'openai' } },
+    { timestamp: '2026-01-02T00:00:01.000Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+    tokenCount('2026-01-02T00:00:02.000Z'),
+  ])
+
+  assert.equal(events.every(event => event.model !== 'openai'), true)
+  assert.equal(usageEvents(events)[0].model, 'gpt-5.6-sol')
+})
+
+test('usage recorded before the first turn_context still carries the real model', async () => {
+  // The model is seeded by scanning ahead for the first turn_context, so a
+  // token_count that lands before it is not left model-less (or, previously,
+  // stamped with the provider id).
+  const events = await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'openai' } },
+    tokenCount('2026-01-02T00:00:01.000Z'),
+    { timestamp: '2026-01-02T00:00:02.000Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+  ])
+
+  assert.equal(usageEvents(events)[0].model, 'gpt-5.6-sol')
+  assert.equal(events.find(event => event.type === 'session.started')?.model, 'gpt-5.6-sol')
+})
+
+test('a rollout with no turn_context leaves the model unset rather than guessing', async () => {
+  const events = await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'session_meta', payload: { id: 'session', cwd: '/w', model_provider: 'crs' } },
+    tokenCount('2026-01-02T00:00:01.000Z'),
+  ])
+
+  assert.equal(usageEvents(events)[0].model, undefined)
+})
+
+test('the reasoning-effort parenthetical some proxies append is stripped', async () => {
+  // `gpt-5.5(xhigh)` is not a catalogue id, and pricing does not vary by
+  // effort — the effort is already carried by other fields.
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-01-02T00:00:00.000Z', type: 'turn_context', payload: { model: 'gpt-5.5(xhigh)' } },
+    tokenCount('2026-01-02T00:00:01.000Z'),
+  ]))
+
+  assert.equal(usages[0].model, 'gpt-5.5')
+})
+
+test('parity: ccusage codex_log_model_fallback — codex-auto-review resolves by date', async () => {
+  // Codex stamps `codex-auto-review` on its automatic review turns; the
+  // tokens bill against whichever review model shipped on that date.
+  // Mirrors ccusage's codex-auto-review-fallbacks.json snapshot.
+  const cases: Array<[string, string]> = [
+    ['2026-05-01T00:00:00.000Z', 'gpt-5.5'],
+    ['2026-04-23T00:00:00.000Z', 'gpt-5.5'],
+    ['2026-04-22T00:00:00.000Z', 'gpt-5.4'],
+    ['2026-02-10T00:00:00.000Z', 'gpt-5.3-codex'],
+    ['2025-09-20T00:00:00.000Z', 'gpt-5-codex'],
+    ['2025-01-01T00:00:00.000Z', 'gpt-5'],
+  ]
+  for (const [ts, expected] of cases) {
+    const usages = usageEvents(await parse([
+      { timestamp: ts, type: 'turn_context', payload: { model: 'codex-auto-review' } },
+      tokenCount(ts),
+    ]))
+    assert.equal(usages[0].model, expected, `${ts} → ${expected}`)
+  }
+})
+
+test('the fast tier still suffixes the resolved model, not the raw label', async () => {
+  const usages = usageEvents(await parse([
+    { timestamp: '2026-05-01T00:00:00.000Z', type: 'turn_context', payload: { model: 'codex-auto-review', service_tier: 'priority' } },
+    tokenCount('2026-05-01T00:00:01.000Z'),
+  ]))
+
+  assert.equal(usages[0].model, 'gpt-5.5-fast')
+})

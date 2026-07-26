@@ -37,13 +37,17 @@ export interface BackfillSourceFile {
 // and the pi/gemini edge cases, and the v6 Codex UUIDv7 creation-anchor
 // that skips copied branch/goal rollout history, and the v7 realpath
 // canonicalization of source file paths so symlinked agent homes stop
-// producing duplicate rollup identities). The CLI compares the
+// producing duplicate rollup identities, and the v8 Codex model-name
+// fixes — `session_meta.model_provider` is no longer stored as the model,
+// the model is seeded from the first `turn_context`, `codex-auto-review`
+// resolves to the review model shipping on that date, and a proxy's
+// effort parenthetical is stripped). The CLI compares the
 // constant against the on-disk schema; on a mismatch it drops every
 // watermark so the next sync silently re-parses all jsonl from scratch
 // and upserts the rebuilt rollups (`replace: true` is already set) — no
 // purge, nothing deleted. Users get the fix transparently the next time
 // their agent runs.
-export const BACKFILL_STATE_SCHEMA_VERSION = 7
+export const BACKFILL_STATE_SCHEMA_VERSION = 8
 
 export interface BackfillIncrementalState {
   version: typeof BACKFILL_STATE_SCHEMA_VERSION
