@@ -96,8 +96,10 @@ async function parseCodexSessionFile(
   // carry only info.total_token_usage (a cumulative), with no per-turn
   // last_token_usage. For those we derive the turn's usage as current-minus-previous
   // cumulative — so we must track the last cumulative we saw. Mirrors ccusage's
-  // previous_totals in subtract_codex_raw_usage.
-  let previousTotals: CodexCumulative = { input: 0, cached: 0, output: 0, reasoning: 0, total: 0 }
+  // previous_totals in subtract_codex_raw_usage. `undefined` means no cumulative
+  // has been seen yet, which is distinct from an all-zero one: the first event of
+  // a file must never look like a repeat of the baseline (ccusage's Option).
+  let previousTotals: CodexCumulative | undefined
   const pendingToolCalls = new Map<string, { tool: string, startedAt: string, turnId: string | undefined }>()
   // Per-turn last activity timestamp and turn start timestamp. When we close a
   // turn implicitly (next user_message, or EOF fallback), turn.completed must
@@ -311,7 +313,17 @@ async function parseCodexSessionFile(
         // events that carry only a cumulative total are counted instead of dropped.
         const totalUsage = objectField(info, 'total_token_usage')
         const hasTotal = Object.keys(totalUsage).length > 0
-        const usage = tokenUsageFromPayload(payload)
+        // Codex re-emits a last_token_usage snapshot when only metadata around it
+        // changed (rate limits, service tier). The cumulative is the authority: if
+        // total_token_usage did not advance, no new tokens were spent, so the
+        // snapshot is a repeat of one already counted. The lastTokenUsageKey dedup
+        // below only catches *consecutive* repeats; this also catches re-emissions
+        // separated by other token_count events. Mirrors ccusage's
+        // cumulative_advanced filter (adapter/codex/parser.rs).
+        const cumulativeAdvanced = !hasTotal
+          || previousTotals === undefined
+          || !sameCodexCumulative(previousTotals, readCodexCumulative(totalUsage))
+        const usage = (cumulativeAdvanced ? tokenUsageFromPayload(payload) : undefined)
           ?? (hasTotal ? codexUsageDelta(totalUsage, previousTotals, info) : undefined)
         // Advance the baseline from every total_token_usage we see — including
         // replayed events we skip — so the first real event's delta is measured
@@ -829,20 +841,28 @@ function readCodexCumulative(usage: Record<string, unknown>): CodexCumulative {
   }
 }
 
+function sameCodexCumulative(a: CodexCumulative, b: CodexCumulative): boolean {
+  return a.input === b.input
+    && a.cached === b.cached
+    && a.output === b.output
+    && a.reasoning === b.reasoning
+    && a.total === b.total
+}
+
 // Per-turn delta from a cumulative total_token_usage minus the prior cumulative
 // baseline (ccusage subtract_codex_raw_usage). Returns undefined when the delta is
 // entirely zero (e.g. a repeated cumulative) so no empty usage event is emitted.
 function codexUsageDelta(
   totalUsage: Record<string, unknown>,
-  previous: CodexCumulative,
+  previous: CodexCumulative | undefined,
   info: Record<string, unknown>,
 ) {
   const cur = readCodexCumulative(totalUsage)
-  const input = Math.max(0, cur.input - previous.input)
-  const cached = Math.max(0, cur.cached - previous.cached)
-  const output = Math.max(0, cur.output - previous.output)
-  const reasoning = Math.max(0, cur.reasoning - previous.reasoning)
-  const total = Math.max(0, cur.total - previous.total)
+  const input = Math.max(0, cur.input - (previous?.input ?? 0))
+  const cached = Math.max(0, cur.cached - (previous?.cached ?? 0))
+  const output = Math.max(0, cur.output - (previous?.output ?? 0))
+  const reasoning = Math.max(0, cur.reasoning - (previous?.reasoning ?? 0))
+  const total = Math.max(0, cur.total - (previous?.total ?? 0))
   if (input === 0 && cached === 0 && output === 0 && reasoning === 0 && total === 0) {
     return
   }

@@ -307,6 +307,57 @@ test('parity: ccusage codex dedupes consecutive identical last_token_usage', asy
   assert.equal(usageEvents(events).length, 1)
 })
 
+test('parity: ccusage codex skips repeated last_token_usage when the cumulative total is unchanged', async () => {
+  // From ccusage adapter/codex/loader.rs
+  // skips_repeated_last_usage_when_cumulative_total_is_unchanged (#1435).
+  const info = {
+    model: 'gpt-5.5',
+    last_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 },
+    total_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 },
+  }
+  const events = await parse([
+    { timestamp: '2026-07-10T08:00:00.000Z', type: 'session_meta', payload: { id: 'session-a', cwd: '/w', model_provider: 'gpt-5.5' } },
+    { timestamp: '2026-07-10T08:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info } },
+    { timestamp: '2026-07-10T08:00:02.000Z', type: 'event_msg', payload: { type: 'token_count', info } },
+  ])
+
+  assert.equal(usageEvents(events).length, 1)
+})
+
+test('parity: ccusage codex skips a stale last_token_usage the cumulative does not back', async () => {
+  // The cumulative check catches what the consecutive-duplicate dedup cannot:
+  // a re-emitted snapshot whose last_token_usage differs from the record right
+  // before it, while total_token_usage stands still. The differing value slips
+  // past lastTokenUsageKey, so only the cumulative proves no tokens were spent.
+  const events = await parse([
+    { timestamp: '2026-07-10T08:00:00.000Z', type: 'session_meta', payload: { id: 'session-a', cwd: '/w', model_provider: 'gpt-5.5' } },
+    // Turn 1.
+    { timestamp: '2026-07-10T08:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.5', last_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 }, total_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 } } } },
+    // Turn 2 — cumulative advances.
+    { timestamp: '2026-07-10T08:00:02.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.5', last_token_usage: { input_tokens: 40, cached_input_tokens: 5, output_tokens: 7, total_tokens: 47 }, total_token_usage: { input_tokens: 140, cached_input_tokens: 25, output_tokens: 17, total_tokens: 157 } } } },
+    // Turn 1's snapshot re-emitted against turn 2's cumulative: no new tokens.
+    { timestamp: '2026-07-10T08:00:03.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.5', last_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 }, total_token_usage: { input_tokens: 140, cached_input_tokens: 25, output_tokens: 17, total_tokens: 157 } } } },
+  ])
+
+  const usages = usageEvents(events)
+  assert.equal(usages.length, 2)
+  assert.equal(usages[0].metrics?.tokensTotal, 110)
+  assert.equal(usages[1].metrics?.tokensTotal, 47)
+})
+
+test('parity: ccusage codex counts the first snapshot even when the cumulative is all zeros', async () => {
+  // ccusage tracks previous_totals as an Option, so the first event of a file is
+  // never mistaken for a repeat of a zeroed baseline.
+  const events = await parse([
+    { timestamp: '2026-07-10T08:00:00.000Z', type: 'session_meta', payload: { id: 'session-a', cwd: '/w', model_provider: 'gpt-5.5' } },
+    { timestamp: '2026-07-10T08:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.5', last_token_usage: { input_tokens: 100, cached_input_tokens: 20, output_tokens: 10, total_tokens: 110 }, total_token_usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, total_tokens: 0 } } } },
+  ])
+
+  const usages = usageEvents(events)
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensTotal, 110)
+})
+
 // ── headless `codex exec` parity (turn.completed / result / bare data.usage) ──
 
 test('parity: ccusage codex loads_saved_codex_exec_json_usage', async () => {
