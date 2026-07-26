@@ -601,6 +601,349 @@ test('the same-second thread_spawn replay skip still works in a UUIDv7-named fil
   assert.equal(usages[0].metrics?.tokensInput, 100)
 })
 
+// ── forked replay matched against the parent rollout's own stream ──
+//
+// The same-second heuristic above only holds when the whole replay burst lands in
+// one second. Long replays span several seconds and nested forks replay a stream
+// that was itself a replay, so Codex-rewritten timestamps cannot anchor them. The
+// token counts, though, are copied verbatim and in order: match the leading usage
+// against the parent's own stream instead. Mirrors ccusage CodexReplayPlan
+// (adapter/codex/replay.rs, #1435).
+
+// Rollout filenames embed the session id; the readable stamp is LOCAL time and is
+// deliberately inconsistent with the UTC event timestamps, as in real rollouts.
+function rolloutNameFor(sessionId: string): string {
+  return `rollout-2026-05-12T17-02-00-${sessionId}.jsonl`
+}
+
+// Write several rollouts into one sessions directory, then parse one of them, so
+// a fork can find the parent log it replayed.
+async function parseAmongRollouts(
+  targetSessionId: string,
+  rollouts: { sessionId: string, records: unknown[] }[],
+): Promise<CanonicalEvent[]> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'codex-sessions-'))
+  for (const rollout of rollouts) {
+    await writeFile(
+      path.join(dir, rolloutNameFor(rollout.sessionId)),
+      rollout.records.map(record => JSON.stringify(record)).join('\n'),
+      'utf8',
+    )
+  }
+  return adapter.parseSessionFile!(path.join(dir, rolloutNameFor(targetSessionId)), { _: [] })
+}
+
+function usageLine(ts: string, usage: Record<string, number>): unknown {
+  return { timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info: { model: 'gpt-5.2', last_token_usage: usage } } }
+}
+
+const USAGE_A = { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, total_tokens: 130 }
+const USAGE_B = { input_tokens: 200, cached_input_tokens: 20, output_tokens: 40, total_tokens: 260 }
+const USAGE_C = { input_tokens: 300, cached_input_tokens: 30, output_tokens: 60, total_tokens: 390 }
+const USAGE_OWN = { input_tokens: 7, cached_input_tokens: 1, output_tokens: 3, total_tokens: 11 }
+
+test('a replay burst spanning several seconds is matched against the parent stream', async () => {
+  // The case the same-second heuristic misses: a long parent history takes more
+  // than a second to replay, so the rewritten stamps span three seconds and
+  // detectSubagentReplaySecond bails out. Before the parent-stream match this
+  // counted the parent's whole history a second time.
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:00:03.000Z', USAGE_C),
+      ],
+    },
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', source: { subagent: { thread_spawn: { parent_thread_id: parent } } } } },
+        // Replayed parent history, re-stamped across three distinct seconds.
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:05:03.000Z', USAGE_C),
+        // The subagent's own turn.
+        usageLine('2026-05-12T08:05:10.000Z', USAGE_OWN),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 7)
+})
+
+test('parity: ccusage codex skips_nested_replays_against_immutable_parent_streams', async () => {
+  // The child replays the parent's WHOLE stream, including the history the parent
+  // had itself copied from the grandparent. The prefix only lines up when the
+  // parent is read unfiltered, which is why the parent stream is loaded with no
+  // replay filtering of its own.
+  const grandparent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const parent = uuidv7At('2026-05-12T08:05:00.000Z')
+  const child = uuidv7At('2026-05-12T08:10:00.000Z')
+  const rollouts = [
+    {
+      sessionId: grandparent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: grandparent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w', forked_from_id: grandparent } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:05:30.000Z', USAGE_C),
+      ],
+    },
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:10:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', forked_from_id: parent } },
+        usageLine('2026-05-12T08:10:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:10:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:10:03.000Z', USAGE_C),
+        usageLine('2026-05-12T08:10:20.000Z', USAGE_OWN),
+      ],
+    },
+  ]
+
+  const childUsages = usageEvents(await parseAmongRollouts(child, rollouts))
+  assert.equal(childUsages.length, 1)
+  assert.equal(childUsages[0].metrics?.tokensInput, 7)
+
+  // The middle session keeps only its own turn too.
+  const parentUsages = usageEvents(await parseAmongRollouts(parent, rollouts))
+  assert.equal(parentUsages.length, 1)
+  assert.equal(parentUsages[0].metrics?.tokensInput, 300)
+})
+
+test('parity: ccusage codex keeps_child_usage_matching_parent_event_after_fork', async () => {
+  // Usage the parent recorded AFTER the fork was never replayed, so it must not
+  // mask the child's own events — even when the child's real turn happens to carry
+  // exactly the same token counts.
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        // Written after the child forked.
+        usageLine('2026-05-12T08:09:00.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', forked_from_id: parent } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        // Real child usage that happens to equal the parent's post-fork event.
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 200)
+})
+
+test('parity: ccusage codex bounds_the_replay_at_a_numeric_fork_timestamp', async () => {
+  // session_meta timestamps are sometimes epoch numbers rather than RFC3339.
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:09:00.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: child,
+      // Epoch seconds for 2026-05-12T08:05:00Z.
+      records: [
+        { timestamp: Date.parse('2026-05-12T08:05:00.000Z') / 1000, type: 'session_meta', payload: { id: child, cwd: '/w', forked_from_id: parent } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 200)
+})
+
+test('parity: ccusage codex falls_back_to_rewritten_second_when_the_replay_starts_mid_parent_stream', async () => {
+  // Codex replayed a compacted history, so it does not line up with the start of
+  // the parent stream. Nothing matched, so the same-second burst decides instead.
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:00:03.000Z', USAGE_C),
+      ],
+    },
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', source: { subagent: { thread_spawn: { parent_thread_id: parent } } } } },
+        // Compacted replay: starts mid-stream, so USAGE_A never appears.
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_B),
+        usageLine('2026-05-12T08:05:01.500Z', USAGE_C),
+        usageLine('2026-05-12T08:05:10.000Z', USAGE_OWN),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 7)
+})
+
+test('parity: ccusage codex keeps_usage_of_a_session_that_lists_itself_as_its_own_parent', async () => {
+  // Matching a session against itself would drop every event it recorded.
+  const self = uuidv7At('2026-05-12T08:00:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(self, [
+    {
+      sessionId: self,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: self, cwd: '/w', forked_from_id: self } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 2)
+})
+
+test('parity: ccusage codex keeps_full_parent_stream_when_the_parent_itself_replayed_a_missing_session', async () => {
+  // The grandparent log is gone, so the parent keeps its own replayed history —
+  // and the child, which copied that whole stream, must still match all of it.
+  const missingGrandparent = uuidv7At('2026-05-12T07:00:00.000Z')
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w', forked_from_id: missingGrandparent } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', forked_from_id: parent } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+        usageLine('2026-05-12T08:05:10.000Z', USAGE_OWN),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 7)
+})
+
+test('a fork whose parent log is unavailable falls back to the same-second heuristic', async () => {
+  // No parent file on disk: the prefix is empty, so nothing can match and the
+  // rewritten-second burst decides — the pre-#1435 behavior, unchanged.
+  const child = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(child, [
+    {
+      sessionId: child,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: child, cwd: '/w', source: { subagent: { thread_spawn: { parent_thread_id: uuidv7At('2026-05-12T08:00:00.000Z') } } } } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:01.500Z', USAGE_B),
+        usageLine('2026-05-12T08:05:10.000Z', USAGE_OWN),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 7)
+})
+
+test('the UUIDv7 anchor and the parent-prefix match stay aligned on a verbatim branch copy', async () => {
+  // A branch fork copies the parent's lines VERBATIM, keeping the original
+  // timestamps, so the creation anchor drops them before the prefix match ever
+  // sees them. Those anchored-away events must still consume their slot in the
+  // parent prefix — otherwise the branch's first real turn is compared against
+  // the head of the prefix, and a turn that happens to repeat the parent's first
+  // usage would be silently deleted.
+  const parent = uuidv7At('2026-05-12T08:00:00.000Z')
+  const branch = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(branch, [
+    {
+      sessionId: parent,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: parent, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: branch,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: branch, cwd: '/w', forked_from_id: parent } },
+        // Copied verbatim: original pre-creation timestamps, caught by the anchor.
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+        // The branch's own turn, which happens to repeat the parent's first usage.
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 1)
+  assert.equal(usages[0].metrics?.tokensInput, 100)
+  assert.equal(usages[0].ts, '2026-05-12T08:05:01.000Z')
+})
+
+test('a normal session that shares usage values with an unrelated rollout is untouched', async () => {
+  // No fork marker → no prefix matching at all, however similar the neighbours.
+  const other = uuidv7At('2026-05-12T08:00:00.000Z')
+  const own = uuidv7At('2026-05-12T08:05:00.000Z')
+  const usages = usageEvents(await parseAmongRollouts(own, [
+    {
+      sessionId: other,
+      records: [
+        { timestamp: '2026-05-12T08:00:00.000Z', type: 'session_meta', payload: { id: other, cwd: '/w' } },
+        usageLine('2026-05-12T08:00:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:00:02.000Z', USAGE_B),
+      ],
+    },
+    {
+      sessionId: own,
+      records: [
+        { timestamp: '2026-05-12T08:05:00.000Z', type: 'session_meta', payload: { id: own, cwd: '/w' } },
+        usageLine('2026-05-12T08:05:01.000Z', USAGE_A),
+        usageLine('2026-05-12T08:05:02.000Z', USAGE_B),
+      ],
+    },
+  ]))
+
+  assert.equal(usages.length, 2)
+})
+
 // ── model naming ──
 //
 // The model that gets stored is the pricing key the backend looks up, so a

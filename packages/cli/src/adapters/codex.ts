@@ -72,17 +72,54 @@ async function parseCodexSessionFile(
   // (e.g. when only rate_limits metadata changes). Dedupe to avoid double-counting tokens
   // and inflating estimated cost.
   let lastTokenUsageKey: string | undefined
-  // Forked subagent rollouts (session_meta.source.subagent.thread_spawn) begin by
-  // REPLAYING the parent session's entire token history, all re-stamped at the
-  // subagent's creation second. The lastTokenUsageKey dedup above only catches
-  // *consecutive identical* records within a file — it cannot catch this replay,
-  // whose cumulative counts differ line to line, so the parent's usage (cached
-  // input especially) was being counted once per subagent file and inflating
-  // totals several-fold. Detect the replay block up front and skip its leading
-  // run of token_count events. Mirrors ccusage detect_subagent_replay_second
-  // (adapter/codex/parser.rs).
+  // Forked rollouts (subagent thread_spawn, branch/goal/resume forks) begin by
+  // REPLAYING the parent session's entire token history. The lastTokenUsageKey
+  // dedup above only catches *consecutive identical* records within a file — it
+  // cannot catch this replay, whose cumulative counts differ line to line, so the
+  // parent's usage (cached input especially) was being counted once per forked
+  // file and inflating totals several-fold.
+  //
+  // Codex copies the token counts verbatim but rewrites the timestamps, so match
+  // the leading usage against the parent's own stream and drop what lines up. The
+  // older same-second heuristic only held when the whole replay burst landed in
+  // one second — it missed long replays and nested forks. It stays as the fallback
+  // for when the parent log is unavailable or the copied history was compacted and
+  // no longer starts at the parent's first event. Mirrors ccusage CodexReplayPlan
+  // + detect_replay_second (adapter/codex/replay.rs, parser.rs).
   const replaySecond = detectSubagentReplaySecond(text, lines)
-  let skipReplay = replaySecond !== undefined
+  const replayPrefix = await codexReplayPrefix(filePath, lines)
+  let replay: { kind: 'matching', index: number } | { kind: 'second' } | { kind: 'done' }
+    = replayPrefix === undefined
+      ? (replaySecond === undefined ? { kind: 'done' } : { kind: 'second' })
+      : { kind: 'matching', index: 0 }
+
+  // Whether a usage event is the rollout's own rather than replayed history.
+  // Each arm either returns or advances the state toward 'done', so the loop only
+  // re-runs to apply the event to the state it switched to.
+  const admitReplayedUsage = (usageKey: string, eventTs: string): boolean => {
+    for (;;) {
+      if (replay.kind === 'matching') {
+        if ((replayPrefix ?? [])[replay.index] === usageKey) {
+          replay = { kind: 'matching', index: replay.index + 1 }
+          return false
+        }
+        // Nothing matched, so the parent stream cannot anchor this replay: the log
+        // is unavailable, or Codex rewrote the copied history. Fall back to the
+        // rewritten-second burst — but only when not a single event lined up,
+        // since a mid-prefix break means the child's own usage has started.
+        replay = replay.index === 0 && replaySecond !== undefined ? { kind: 'second' } : { kind: 'done' }
+        continue
+      }
+      if (replay.kind === 'second') {
+        if (eventTs.slice(0, 19) === replaySecond) {
+          return false
+        }
+        replay = { kind: 'done' }
+        continue
+      }
+      return true
+    }
+  }
   // Branch/goal/resume forks copy the parent rollout's lines VERBATIM into the
   // new file, keeping the original timestamps — nothing is re-stamped, so the
   // same-second heuristic above can't catch them. But the file's own events can
@@ -230,9 +267,18 @@ async function parseCodexSessionFile(
     // measured against the copied prior cumulative, not zero.
     if (creationMs !== undefined && Date.parse(ts) < creationMs) {
       if (payloadType === 'token_count') {
-        const copiedTotal = objectField(objectField(payload, 'info'), 'total_token_usage')
-        if (Object.keys(copiedTotal).length > 0) {
-          previousTotals = readCodexCumulative(copiedTotal)
+        const step = codexTokenCountUsage(payload, previousTotals)
+        previousTotals = step.nextTotals
+        // Keep the parent-stream match aligned with what the anchor already
+        // dropped. Both layers target the same copied history, so a copied event
+        // the anchor removed must still consume its slot in the parent prefix —
+        // otherwise the rollout's first real event gets compared against the
+        // prefix head and can be mistaken for replay. Only advance on a match:
+        // this line is discarded either way, so it must not push the state
+        // machine off `matching` for the events that follow.
+        if (step.usage && replay.kind === 'matching'
+          && (replayPrefix ?? [])[replay.index] === codexUsageKey(step.usage)) {
+          replay = { kind: 'matching', index: replay.index + 1 }
         }
       }
       continue
@@ -308,46 +354,18 @@ async function parseCodexSessionFile(
         if (tierFromInfo) {
           serviceTier = tierFromInfo.toLowerCase()
         }
-        // Per-turn usage: prefer last_token_usage; otherwise derive the delta from
-        // the cumulative total_token_usage minus the running baseline, so token_count
-        // events that carry only a cumulative total are counted instead of dropped.
-        const totalUsage = objectField(info, 'total_token_usage')
-        const hasTotal = Object.keys(totalUsage).length > 0
-        // Codex re-emits a last_token_usage snapshot when only metadata around it
-        // changed (rate limits, service tier). The cumulative is the authority: if
-        // total_token_usage did not advance, no new tokens were spent, so the
-        // snapshot is a repeat of one already counted. The lastTokenUsageKey dedup
-        // below only catches *consecutive* repeats; this also catches re-emissions
-        // separated by other token_count events. Mirrors ccusage's
-        // cumulative_advanced filter (adapter/codex/parser.rs).
-        const cumulativeAdvanced = !hasTotal
-          || previousTotals === undefined
-          || !sameCodexCumulative(previousTotals, readCodexCumulative(totalUsage))
-        const usage = (cumulativeAdvanced ? tokenUsageFromPayload(payload) : undefined)
-          ?? (hasTotal ? codexUsageDelta(totalUsage, previousTotals, info) : undefined)
+        const step = codexTokenCountUsage(payload, previousTotals)
         // Advance the baseline from every total_token_usage we see — including
         // replayed events we skip — so the first real event's delta is measured
         // against the right prior cumulative.
-        if (hasTotal) {
-          previousTotals = readCodexCumulative(totalUsage)
-        }
+        previousTotals = step.nextTotals
+        const usage = step.usage
         if (usage) {
-          // Drop the leading run of replayed parent-history token_count events in a
-          // forked subagent rollout (all stamped at the replay second). The first
-          // event at a later second is the subagent's own usage and ends the skip.
-          if (skipReplay) {
-            if (ts.slice(0, 19) === replaySecond) {
-              break
-            }
-            skipReplay = false
+          const usageKey = codexUsageKey(usage)
+          // Drop the parent history a forked rollout replayed on open.
+          if (!admitReplayedUsage(usageKey, ts)) {
+            break
           }
-          const usageKey = [
-            usage.tokensInput,
-            usage.tokensCachedInput,
-            usage.tokensOutput,
-            usage.tokensReasoningOutput,
-            usage.tokensTotal,
-          ].join(':')
           if (usageKey === lastTokenUsageKey) {
             break
           }
@@ -765,6 +783,185 @@ function rolloutCreationMs(filePath: string): number | undefined {
   return Number.isFinite(ms) && ms > 0 ? ms : undefined
 }
 
+// ── forked-session replay: match the copied prefix against the parent stream ──
+
+interface CodexStreamEvent {
+  key: string
+  tsMs: number | undefined
+}
+
+// The `session_meta` line names the session this rollout forked from: branch and
+// resume forks set `forked_from_id`, subagent spawns nest the id under
+// `source.subagent.thread_spawn.parent_thread_id`. The line's own timestamp is the
+// fork instant. Mirrors ccusage read_codex_session_metadata (adapter/codex/replay.rs).
+function codexForkInfo(lines: string[]): { parentId: string | undefined, forkedAtMs: number | undefined } {
+  const raw = lines.length > 0 ? parseJsonLine(lines[0]) : undefined
+  if (!raw || stringField(raw, 'type') !== 'session_meta') {
+    return { parentId: undefined, forkedAtMs: undefined }
+  }
+  const payload = objectField(raw, 'payload')
+  const threadSpawn = objectField(objectField(objectField(payload, 'source'), 'subagent'), 'thread_spawn')
+  const parentId = stringField(payload, 'forked_from_id') || stringField(threadSpawn, 'parent_thread_id')
+  const forkedAt = timestampFrom(raw.timestamp)
+  return {
+    parentId: parentId || undefined,
+    forkedAtMs: forkedAt ? Date.parse(forkedAt) : undefined,
+  }
+}
+
+// Rollout filenames embed the session id: `rollout-<local time>-<session uuid>.jsonl`,
+// where the uuid equals `session_meta.payload.id` (verified against real rollouts).
+// That lets a parent be located from its id without opening candidate files.
+const ROLLOUT_SESSION_ID_RE = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/
+
+function codexSessionIdFromFileName(filePath: string): string | undefined {
+  return path.basename(filePath).match(ROLLOUT_SESSION_ID_RE)?.[1]
+}
+
+// Codex lays sessions out as `<CODEX_HOME>/sessions/YYYY/MM/DD/` and rotates old
+// ones into `archived_sessions/`, so a parent can sit under either root and under
+// any date. Outside that layout (relocated logs, tests) search the child's own
+// directory. Active sessions come first so they win over an archived copy.
+function codexRolloutSearchRoots(childPath: string): string[] {
+  const dir = path.dirname(childPath)
+  const parts = dir.split(path.sep)
+  const index = Math.max(parts.lastIndexOf('sessions'), parts.lastIndexOf('archived_sessions'))
+  if (index <= 0) {
+    return [dir]
+  }
+  const codexRoot = parts.slice(0, index).join(path.sep)
+  return [path.join(codexRoot, 'sessions'), path.join(codexRoot, 'archived_sessions')]
+}
+
+const codexSessionIndexCache = new Map<string, Promise<Map<string, string>>>()
+
+async function buildCodexSessionIndex(roots: string[]): Promise<Map<string, string>> {
+  const index = new Map<string, string>()
+  for (const root of roots) {
+    let files: string[]
+    try {
+      files = await listJsonlFiles(root)
+    }
+    catch {
+      continue
+    }
+    for (const file of files) {
+      const id = codexSessionIdFromFileName(file)
+      if (id && !index.has(id)) {
+        index.set(id, file)
+      }
+    }
+  }
+  return index
+}
+
+async function codexRolloutPathForSession(childPath: string, sessionId: string): Promise<string | undefined> {
+  const roots = codexRolloutSearchRoots(childPath)
+  const cacheKey = roots.join('\0')
+  let index = codexSessionIndexCache.get(cacheKey)
+  if (!index) {
+    index = buildCodexSessionIndex(roots)
+    codexSessionIndexCache.set(cacheKey, index)
+  }
+  const sessionPaths = await index
+  return sessionPaths.get(sessionId)
+}
+
+interface CodexUsageStreamCacheEntry { mtimeMs: number, size: number, stream: CodexStreamEvent[] }
+
+const codexUsageStreamCache = new Map<string, CodexUsageStreamCacheEntry>()
+
+/**
+ * The usage a session recorded, in order, with NO replay filtering applied.
+ *
+ * A nested fork replays its parent's whole stream — including the history that
+ * parent had itself copied from the grandparent — so the prefix only lines up
+ * against the *unfiltered* stream. Mirrors ccusage read_usage_events, which visits
+ * the parent with `replayed_prefix: None` (adapter/codex/replay.rs).
+ *
+ * Only session-format `token_count` lines are read: a rollout must carry a
+ * session_meta to be named as someone's parent, so headless `codex exec` files
+ * never appear here.
+ */
+async function codexUsageStream(filePath: string): Promise<CodexStreamEvent[]> {
+  let info
+  try {
+    info = await stat(filePath)
+  }
+  catch {
+    return []
+  }
+  const cached = codexUsageStreamCache.get(filePath)
+  if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+    return cached.stream
+  }
+
+  let text: string
+  try {
+    text = await readFile(filePath, 'utf8')
+  }
+  catch {
+    return []
+  }
+
+  const stream: CodexStreamEvent[] = []
+  let previousTotals: CodexCumulative | undefined
+  for (const line of text.split('\n')) {
+    if (!line) {
+      continue
+    }
+    const raw = parseJsonLine(line)
+    if (!raw || stringField(raw, 'type') !== 'event_msg') {
+      continue
+    }
+    const payload = objectField(raw, 'payload')
+    if (stringField(payload, 'type') !== 'token_count') {
+      continue
+    }
+    const step = codexTokenCountUsage(payload, previousTotals)
+    previousTotals = step.nextTotals
+    if (!step.usage) {
+      continue
+    }
+    const ts = timestampFrom(raw.timestamp) || timestampFrom(payload.timestamp)
+    stream.push({ key: codexUsageKey(step.usage), tsMs: ts ? Date.parse(ts) : undefined })
+  }
+
+  codexUsageStreamCache.set(filePath, { mtimeMs: info.mtimeMs, size: info.size, stream })
+  return stream
+}
+
+/**
+ * Usage keys a forked rollout replayed from its parent, in order.
+ *
+ * Returns undefined for rollouts that are not forks, and an empty array for forks
+ * whose parent log is unavailable — which tells the caller to fall back to the
+ * rewritten-second heuristic. Mirrors CodexReplayPlan::replay_prefix.
+ */
+async function codexReplayPrefix(filePath: string, lines: string[]): Promise<string[] | undefined> {
+  const { parentId, forkedAtMs } = codexForkInfo(lines)
+  if (!parentId) {
+    return undefined
+  }
+  // A session listing itself as its own parent would match its whole stream and
+  // drop every event it recorded.
+  if (codexSessionIdFromFileName(filePath) === parentId) {
+    return []
+  }
+  const parentPath = await codexRolloutPathForSession(filePath, parentId)
+  if (!parentPath || path.resolve(parentPath) === path.resolve(filePath)) {
+    return []
+  }
+  const stream = await codexUsageStream(parentPath)
+  // Usage the parent recorded after the fork was never replayed, so it must not
+  // mask the child's own events.
+  const after = forkedAtMs === undefined
+    ? -1
+    : stream.findIndex(event => event.tsMs !== undefined && event.tsMs > forkedAtMs)
+  const replayed = after === -1 ? stream : stream.slice(0, after)
+  return replayed.map(event => event.key)
+}
+
 // Codex spawns a subagent into its own rollout file that opens by replaying the
 // parent session's token history, re-stamped at the subagent's creation second.
 // Return that second when this file is such a replay so the parser can drop the
@@ -838,6 +1035,53 @@ function readCodexCumulative(usage: Record<string, unknown>): CodexCumulative {
     output: numberField(usage, 'output_tokens') ?? 0,
     reasoning: numberField(usage, 'reasoning_output_tokens') ?? 0,
     total: numberField(usage, 'total_tokens') ?? 0,
+  }
+}
+
+type CodexUsageMetrics = NonNullable<ReturnType<typeof tokenUsageFromPayload>>
+
+// Identity of a usage event: the token counts themselves. Used both to dedupe
+// consecutive repeats and to line a forked rollout's replayed history up against
+// its parent's stream, where Codex copies the counts but rewrites everything else.
+function codexUsageKey(usage: CodexUsageMetrics): string {
+  return [
+    usage.tokensInput,
+    usage.tokensCachedInput,
+    usage.tokensOutput,
+    usage.tokensReasoningOutput,
+    usage.tokensTotal,
+  ].join(':')
+}
+
+/**
+ * Per-turn usage carried by one `token_count` payload, plus the cumulative
+ * baseline to carry into the next one.
+ *
+ * Prefers `last_token_usage`; otherwise derives the delta from the cumulative
+ * `total_token_usage` minus the running baseline, so token_count events that
+ * carry only a cumulative total are counted instead of dropped.
+ *
+ * Codex re-emits a last_token_usage snapshot when only metadata around it changed
+ * (rate limits, service tier). The cumulative is the authority: if
+ * total_token_usage did not advance, no new tokens were spent, so the snapshot is
+ * a repeat of one already counted. Mirrors ccusage's cumulative_advanced filter
+ * (adapter/codex/parser.rs).
+ */
+function codexTokenCountUsage(
+  payload: Record<string, unknown>,
+  previousTotals: CodexCumulative | undefined,
+): { usage: CodexUsageMetrics | undefined, nextTotals: CodexCumulative | undefined } {
+  const info = objectField(payload, 'info')
+  const totalUsage = objectField(info, 'total_token_usage')
+  const hasTotal = Object.keys(totalUsage).length > 0
+  const cumulativeAdvanced = !hasTotal
+    || previousTotals === undefined
+    || !sameCodexCumulative(previousTotals, readCodexCumulative(totalUsage))
+  const usage = (cumulativeAdvanced ? tokenUsageFromPayload(payload) : undefined)
+    ?? (hasTotal ? codexUsageDelta(totalUsage, previousTotals, info) : undefined)
+  return {
+    usage,
+    nextTotals: hasTotal ? readCodexCumulative(totalUsage) : previousTotals,
   }
 }
 
