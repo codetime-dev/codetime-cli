@@ -337,7 +337,7 @@ export interface StoredCanonicalEvent extends CanonicalEvent {
   receivedAt: string
 }
 
-export const BACKFILL_SOURCE_IDS = ['codex', 'claude-code', 'opencode', 'pi', 'amp', 'gemini'] as const
+export const BACKFILL_SOURCE_IDS = ['codex', 'claude-code', 'opencode', 'pi', 'amp', 'gemini', 'kimi'] as const
 export type BackfillSourceId = typeof BACKFILL_SOURCE_IDS[number]
 export type ImportRunStatus = 'planned' | 'running' | 'completed' | 'failed' | 'cancelled'
 

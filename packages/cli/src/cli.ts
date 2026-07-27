@@ -24,6 +24,7 @@ import { ampBackfillFiles, createAmpAdapter } from './adapters/amp.js'
 import { createClaudeCodeAdapter } from './adapters/claude-code.js'
 import { codexBackfillFiles, createCodexAdapter } from './adapters/codex.js'
 import { createGeminiAdapter, geminiBackfillFiles } from './adapters/gemini.js'
+import { createKimiAdapter, kimiBackfillFiles } from './adapters/kimi.js'
 import { createOpenCodeAdapter, opencodeBackfillFiles } from './adapters/opencode.js'
 import { createPiAdapter } from './adapters/pi.js'
 import { AdapterRegistry } from './adapters/registry.js'
@@ -59,6 +60,7 @@ function createRegistry(): AdapterRegistry {
   registry.register(createOpenCodeAdapter())
   registry.register(createAmpAdapter())
   registry.register(createGeminiAdapter())
+  registry.register(createKimiAdapter())
   return registry
 }
 
@@ -641,6 +643,12 @@ async function listBackfillSourceFiles(
   }
   if (source.id === 'gemini') {
     return canonicalizeBackfillFiles(await geminiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env))
+  }
+  // Kimi keeps non-usage jsonl next to each run's wire.jsonl and nests it at two
+  // different depths, so the generic "every .jsonl under the root" listing would
+  // both miss and over-collect.
+  if (source.id === 'kimi') {
+    return canonicalizeBackfillFiles(await kimiBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env))
   }
   if (source.id === 'codex') {
     const files = await codexBackfillFiles(stringOption(options['source-root']), resolveHome(options, ctx), ctx.env)
