@@ -1,3 +1,18 @@
+## v0.8.0
+
+[v0.7.7...v0.8.0](https://github.com/codetime-dev/codetime-cli/compare/v0.7.7...v0.8.0)
+
+### :sparkles: Features
+
+- **cli**: add Kimi Code (`~/.kimi`, `~/.kimi-code`) as a backfill source — reads both wire schemas (the newer `usage.record` lines and the older StatusUpdate payload), counts only turn-scoped records so cumulative session totals are not double-counted, and discovers `wire.jsonl` at both nesting depths - By [Jianqi Pan](mailto:jannchie@gmail.com) in [14ffec8](https://github.com/codetime-dev/codetime-cli/commit/14ffec8)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: match a forked Codex rollout's replayed history against its parent's own usage stream instead of the same-second heuristic, which missed replays spanning several seconds and nested forks — the parent's usage (cached input especially) was being counted once per forked file (ccusage parity, #1435) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [b575203](https://github.com/codetime-dev/codetime-cli/commit/b575203)
+- **cli**: count Claude `advisor_message` iteration tokens — an advisor call bills at its own model's rate and is not part of the enclosing `message.usage`, so those tokens were dropped entirely (ccusage parity, #1423) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [22c9f80](https://github.com/codetime-dev/codetime-cli/commit/22c9f80)
+- **cli**: drop a re-emitted Codex `last_token_usage` snapshot when the cumulative `total_token_usage` did not advance — the previous dedup only caught consecutive repeats - By [Jianqi Pan](mailto:jannchie@gmail.com) in [137fe2a](https://github.com/codetime-dev/codetime-cli/commit/137fe2a)
+- **cli**: bump backfill state schema to v9 so the Codex/Claude token fixes re-apply to already-uploaded history on next sync (non-destructive re-parse + replace; Codex fork-heavy history will get *smaller*, which is the correction) - By [Jianqi Pan](mailto:jannchie@gmail.com) in [ff37d6d](https://github.com/codetime-dev/codetime-cli/commit/ff37d6d)
+
 ## v0.7.7
 
 [v0.7.6...v0.7.7](https://github.com/codetime-dev/codetime-cli/compare/v0.7.6...v0.7.7)
