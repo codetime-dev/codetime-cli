@@ -1,11 +1,13 @@
 import type { RunContext } from '../src/lib/types.ts'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 // eslint-disable-next-line test/no-import-node-test -- This repo uses node:test as the runner.
 import { test } from 'node:test'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { codexBackfillFiles, createCodexAdapter } from '../src/adapters/codex.ts'
 import { run, syncLocalRunnerEntryArgs } from '../src/cli.ts'
 import { ensureLocalMachineId, machineIdPath, readConfig, writeConfig } from '../src/lib/config.ts'
@@ -1282,6 +1284,81 @@ test('PI_CODING_AGENT_DIR relocates Pi detect and install paths', async () => {
   const extension = await readFile(path.join(piDir, 'extensions', 'codetime.ts'), 'utf8')
   assert.match(extension, /"codetime"/)
   assert.match(extension, /"--agent", "pi"/)
+})
+
+// The Pi extension runs inside pi's own process, so anything report() does
+// wrong takes pi down with it. These two cases are the ones that actually bit:
+// a missing `codetime` binary used to raise an unhandled 'error' event (pi died
+// on session_start, i.e. it would not start at all), and an attached child kept
+// pi's event loop alive for the whole duration of the sync the hook triggers.
+async function runPiExtensionHarness(env: NodeJS.ProcessEnv): Promise<{ code: number | null, elapsedMs: number }> {
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const piDir = await mkdtemp(path.join(tmpdir(), 'pi-agent-'))
+  const exitCode = await run(['install', '--target', 'pi', '--home', home], testContext({
+    env: { HOME: home, PI_CODING_AGENT_DIR: piDir },
+  }))
+  assert.equal(exitCode, 0)
+
+  const extensionPath = path.join(piDir, 'extensions', 'codetime.ts')
+  const harnessPath = path.join(piDir, 'harness.mjs')
+  await writeFile(harnessPath, `
+    const mod = await import(${JSON.stringify(pathToFileURL(extensionPath).href)})
+    const handlers = new Map()
+    mod.default({ on: (name, fn) => handlers.set(name, fn) })
+    await handlers.get('session_start')({ id: 'sess', cwd: process.cwd() })
+  `, 'utf8')
+
+  const startedAt = Date.now()
+  const child = spawn(process.execPath, ['--import', 'tsx', harnessPath], {
+    // tsx resolves from cwd, and the harness imports the generated extension.
+    cwd: path.resolve(fileURLToPath(new URL('..', import.meta.url))),
+    env,
+    stdio: ['ignore', 'ignore', 'ignore'],
+  })
+  const code = await new Promise<number | null>((resolve) => {
+    child.on('exit', resolve)
+    child.on('error', () => resolve(-1))
+  })
+  return { code, elapsedMs: Date.now() - startedAt }
+}
+
+test('Pi extension survives a codetime binary that is not on PATH', async () => {
+  const emptyBin = await mkdtemp(path.join(tmpdir(), 'empty-bin-'))
+  const { code } = await runPiExtensionHarness({
+    ...process.env,
+    PATH: emptyBin,
+    Path: emptyBin,
+  })
+  assert.equal(code, 0, 'reporting must not crash the host agent when codetime is missing')
+})
+
+test('Pi extension does not hold the host process open while the hook runs', async () => {
+  const fakeBin = await mkdtemp(path.join(tmpdir(), 'fake-bin-'))
+  const fakeCodetime = path.join(fakeBin, 'codetime')
+  await writeFile(fakeCodetime, '#!/bin/sh\nsleep 30\n', { encoding: 'utf8', mode: 0o755 })
+
+  const { code, elapsedMs } = await runPiExtensionHarness({
+    ...process.env,
+    PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
+  })
+  assert.equal(code, 0)
+  assert.ok(elapsedMs < 15_000, `host exited in ${elapsedMs}ms; the hook child is keeping it alive`)
+})
+
+test('Pi extension spawns through the shell on Windows', async () => {
+  // `codetime` is installed as a .cmd shim on Windows and spawn() does no
+  // PATHEXT resolution, so a plain spawn always raises ENOENT there. This
+  // branch cannot be exercised on POSIX, so assert on the emitted source.
+  const home = await mkdtemp(path.join(tmpdir(), 'codetime-'))
+  const piDir = await mkdtemp(path.join(tmpdir(), 'pi-agent-'))
+  await run(['install', '--target', 'pi', '--home', home], testContext({
+    env: { HOME: home, PI_CODING_AGENT_DIR: piDir },
+  }))
+
+  const extension = await readFile(path.join(piDir, 'extensions', 'codetime.ts'), 'utf8')
+  assert.match(extension, /const isWindows = process\.platform === "win32"/)
+  assert.match(extension, /shell: isWindows/)
+  assert.match(extension, /detached: !isWindows/)
 })
 
 test('PI_CODING_AGENT_SESSION_DIR relocates only the Pi sessions dir, not the install path', async () => {

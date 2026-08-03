@@ -432,12 +432,32 @@ function piExtensionContent(): string {
 import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+// Fire-and-forget: the extension runs inside pi's own process, so a failure
+// here must never surface. Three hazards to keep muzzled:
+//   - on Windows \`codetime\` is a .cmd shim and spawn() does no PATHEXT
+//     resolution, so a plain spawn always fails there — run it through the
+//     shell instead;
+//   - a spawn failure emits an unhandled 'error' event, which kills pi outright
+//     (the throw lands on a later tick, outside any try/catch or pi's own
+//     handler guard) — and the first report fires on session_start, so pi dies
+//     at startup;
+//   - the hook triggers a full local sync, so an attached child keeps pi's
+//     event loop alive for as long as that sync runs — unref/detach it.
 function report(payload: Record<string, unknown>) {
-  const child = spawn("codetime", ["hook", "--agent", "pi"], {
-    stdio: ["pipe", "ignore", "ignore"],
-  });
-  child.stdin.write(JSON.stringify(payload));
-  child.stdin.end();
+  const isWindows = process.platform === "win32";
+  try {
+    const child = spawn("codetime", ["hook", "--agent", "pi"], {
+      stdio: ["pipe", "ignore", "ignore"],
+      shell: isWindows,
+      windowsHide: true,
+      // A detached child under cmd.exe can surface a stray console window.
+      detached: !isWindows,
+    });
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(payload));
+    child.unref();
+  } catch {}
 }
 
 export default function (pi: ExtensionAPI) {
