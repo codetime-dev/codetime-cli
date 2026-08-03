@@ -1,3 +1,11 @@
+## v0.8.1
+
+[v0.8.0...v0.8.1](https://github.com/codetime-dev/codetime-cli/compare/v0.8.0...v0.8.1)
+
+### :adhesive_bandage: Fixes
+
+- **cli**: stop the installed Pi extension from killing pi on startup — on Windows `codetime` is a `.cmd` shim and `spawn()` does no PATHEXT resolution, so the first report (`session_start`) raised an unhandled `ENOENT` error event and took pi down with it; the hook now runs through the shell on win32, swallows spawn/stdin errors, and unrefs the child so a long local sync no longer pins pi's event loop - By [Jianqi Pan](mailto:jannchie@gmail.com) in [362ead0](https://github.com/codetime-dev/codetime-cli/commit/362ead0)
+
 ## v0.8.0
 
 [v0.7.7...v0.8.0](https://github.com/codetime-dev/codetime-cli/compare/v0.7.7...v0.8.0)
